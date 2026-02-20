@@ -125,13 +125,13 @@ wss.on("connection", (telnyxWs, req) => {
 	});
 
 	const dgUrl =
-		"wss://api.deepgram.com/v1/listen" +
-		"?model=flux" +
-		"&encoding=alaw" +
-		"&sample_rate=8000" +
-		"&smart_format=true" +
-		"&interim_results=true" +
-		"&endpointing=300";
+	    "wss://api.deepgram.com/v1/listen" +
+	    "?model=nova-2" +
+	    "&encoding=mulaw" +
+	    "&sample_rate=8000" +
+	    "&smart_format=true" +
+	    "&interim_results=true" +
+	    "&endpointing=200";
 
 	const dgWs = new WebSocket(dgUrl, {
 		headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }
@@ -270,3 +270,4 @@ server.listen(PORT, () => {
 		hasControlSecret: !!CONTROL_SECRET
 	});
 });
+
