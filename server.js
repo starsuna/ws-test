@@ -10,8 +10,8 @@ function ts() {
 }
 
 function roleFromPath(path) {
-	if (path === "/in") return "Rep";
-	if (path === "/out") return "Prospect";
+	if (path === "/in") return "Prospect";  // inbound = audio from the person you called
+	if (path === "/out") return "Rep";       // outbound = your voice going out
 	return "Unknown";
 }
 
