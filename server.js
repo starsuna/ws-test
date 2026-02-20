@@ -1,47 +1,76 @@
 const http = require('http');
 const WebSocket = require('ws');
+const https = require('https');
+
+const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
+const TRANSCRIPT_ENDPOINT = "https://lumafront.com/database/AI/sale_assistant/webhooks/transcript.php";
 
 const port = process.env.PORT || 10000;
 
 const server = http.createServer((req, res) => {
-	res.writeHead(200, { 'Content-Type': 'text/plain' });
-	res.end('ok\n');
+	res.writeHead(200);
+	res.end("ok\n");
 });
 
 const wss = new WebSocket.Server({ server });
 
-wss.on('connection', (ws, req) => {
-	console.log('WS_CONNECTED', req.headers['user-agent'] || '');
+wss.on('connection', (telnyxWs) => {
 
-	ws.on('message', (msg) => {
+	const dgWs = new WebSocket(
+		"wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=2&diarize=true",
+		{
+			headers: {
+				Authorization: `Token ${DEEPGRAM_API_KEY}`
+			}
+		}
+	);
+
+	dgWs.on('open', () => {
+		console.log("DEEPGRAM_CONNECTED");
+	});
+
+	telnyxWs.on('message', (msg) => {
+
 		if (Buffer.isBuffer(msg)) {
-			console.log('WS_BIN', msg.length);
+			if (dgWs.readyState === WebSocket.OPEN) {
+				dgWs.send(msg);
+			}
 			return;
 		}
 
-		const s = msg.toString('utf8');
-		console.log('WS_TEXT', s.length);
+	});
 
-		try {
-			const j = JSON.parse(s);
-			console.log('WS_JSON_KEYS', Object.keys(j));
-			if (j.event) console.log('WS_EVENT', j.event);
-			if (j.event_type) console.log('WS_EVENT_TYPE', j.event_type);
-			if (j.stream_id) console.log('WS_STREAM_ID', j.stream_id);
-		} catch (e) {
-			console.log('WS_TEXT_RAW', s.slice(0, 200));
+	dgWs.on('message', (dgMsg) => {
+
+		const data = JSON.parse(dgMsg.toString());
+
+		if (!data.channel || !data.channel.alternatives) return;
+
+		const transcript = data.channel.alternatives[0].transcript;
+		if (!transcript) return;
+
+		const payload = JSON.stringify({ transcript });
+
+		const req = https.request(TRANSCRIPT_ENDPOINT, {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'application/json',
+				'Content-Length': payload.length
+			}
+		});
+
+		req.write(payload);
+		req.end();
+	});
+
+	telnyxWs.on('close', () => {
+		if (dgWs.readyState === WebSocket.OPEN) {
+			dgWs.close();
 		}
 	});
 
-	ws.on('close', (code, reason) => {
-		console.log('WS_CLOSED', code, reason?.toString() || '');
-	});
-
-	ws.on('error', (err) => {
-		console.log('WS_ERROR', err.message);
-	});
 });
 
 server.listen(port, () => {
-	console.log('Listening on', port);
+	console.log("Listening on", port);
 });
