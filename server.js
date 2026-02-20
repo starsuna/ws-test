@@ -31,58 +31,89 @@ const wss = new WebSocket.Server({ noServer: true });
 // Key: callControlId, Value: { Rep: wallMs, Prospect: wallMs }
 const callSpeechTimes = {};
 
-// Buffer raw PCMA audio per call per role for saving after call ends
-// Key: callControlId_role, Value: array of Buffer chunks
+// Buffer raw PCMA audio per call per role
+// Key: callControlId, Value: { Rep: [Buffer,...], Prospect: [Buffer,...], stopped: 0 }
 const audioBuffers = {};
 
 function makeWavHeader(dataLength, sampleRate = 8000, channels = 1) {
-	// WAV header for PCMA (G.711 A-law), 8-bit samples
 	const header = Buffer.alloc(44);
-	const fileSize = dataLength + 36;
 	header.write('RIFF', 0);
-	header.writeUInt32LE(fileSize, 4);
+	header.writeUInt32LE(dataLength + 36, 4);
 	header.write('WAVE', 8);
 	header.write('fmt ', 12);
-	header.writeUInt32LE(16, 16);           // chunk size
-	header.writeUInt16LE(6, 20);            // PCM A-law = 6
+	header.writeUInt32LE(16, 16);
+	header.writeUInt16LE(6, 20);            // 6 = PCMA / A-law
 	header.writeUInt16LE(channels, 22);
 	header.writeUInt32LE(sampleRate, 24);
-	header.writeUInt32LE(sampleRate * channels, 28); // byte rate
-	header.writeUInt16LE(channels, 32);     // block align
-	header.writeUInt16LE(8, 34);            // bits per sample
+	header.writeUInt32LE(sampleRate * channels, 28);
+	header.writeUInt16LE(channels, 32);
+	header.writeUInt16LE(8, 34);            // 8-bit samples
 	header.write('data', 36);
 	header.writeUInt32LE(dataLength, 40);
 	return header;
 }
 
-async function uploadAudioToServer(callControlId, role, audioData) {
-	if (!audioData || audioData.length === 0) return;
-	try {
-		const wavHeader = makeWavHeader(audioData.length);
-		const wavFile   = Buffer.concat([wavHeader, audioData]);
+function mixAlaw(repBuf, prospectBuf) {
+	// Decode A-law to 16-bit PCM, mix, re-encode to A-law
+	// A-law decode/encode tables
+	const alawDecode = new Int16Array(256);
+	for (let i = 0; i < 256; i++) {
+		let val = i ^ 0x55;
+		let seg = (val & 0x70) >> 4;
+		let t = (val & 0x0F) << 1 | 1;
+		if (seg) t = (t + 32) << (seg - 1);
+		alawDecode[i] = (val & 0x80) ? t : -t;
+	}
 
-		// Build multipart form manually
+	const len = Math.max(repBuf.length, prospectBuf.length);
+	const mixed = Buffer.alloc(len);
+
+	for (let i = 0; i < len; i++) {
+		const s1 = i < repBuf.length      ? alawDecode[repBuf[i]]      : 0;
+		const s2 = i < prospectBuf.length ? alawDecode[prospectBuf[i]] : 0;
+		let sum = s1 + s2;
+		// Clamp to 16-bit
+		if (sum > 32767)  sum = 32767;
+		if (sum < -32768) sum = -32768;
+		// Re-encode to A-law
+		const sign = (sum >= 0) ? 0x80 : 0x00;
+		if (sum < 0) sum = -sum;
+		let enc;
+		if      (sum <= 31)    enc = (sum >> 1) | 0x00;
+		else if (sum <= 63)    enc = ((sum - 32) >> 1) | 0x10;
+		else if (sum <= 127)   enc = ((sum - 64) >> 2) | 0x20;
+		else if (sum <= 255)   enc = ((sum - 128) >> 3) | 0x30;
+		else if (sum <= 511)   enc = ((sum - 256) >> 4) | 0x40;
+		else if (sum <= 1023)  enc = ((sum - 512) >> 5) | 0x50;
+		else if (sum <= 2047)  enc = ((sum - 1024) >> 6) | 0x60;
+		else if (sum <= 4095)  enc = ((sum - 2048) >> 7) | 0x70;
+		else                   enc = 0x7F;
+		mixed[i] = (enc | sign) ^ 0x55;
+	}
+	return mixed;
+}
+
+async function uploadMixedAudio(callControlId, repChunks, prospectChunks) {
+	try {
+		const repBuf      = Buffer.concat(repChunks);
+		const prospectBuf = Buffer.concat(prospectChunks);
+		const mixedPcm    = mixAlaw(repBuf, prospectBuf);
+		const wavHeader   = makeWavHeader(mixedPcm.length);
+		const wavFile     = Buffer.concat([wavHeader, mixedPcm]);
+
+		console.log(ts(), 'AUDIO MIX', { callControlId, repBytes: repBuf.length, prospectBytes: prospectBuf.length, mixedBytes: mixedPcm.length });
+
 		const boundary = '----FormBoundary' + Date.now();
 		const CRLF = '\r\n';
-
 		const metaPart =
 			'--' + boundary + CRLF +
 			'Content-Disposition: form-data; name="call_control_id"' + CRLF + CRLF +
 			callControlId + CRLF +
 			'--' + boundary + CRLF +
-			'Content-Disposition: form-data; name="role"' + CRLF + CRLF +
-			role + CRLF +
-			'--' + boundary + CRLF +
 			'Content-Disposition: form-data; name="audio"; filename="audio.wav"' + CRLF +
 			'Content-Type: audio/wav' + CRLF + CRLF;
-
 		const endPart = CRLF + '--' + boundary + '--' + CRLF;
-
-		const body = Buffer.concat([
-			Buffer.from(metaPart),
-			wavFile,
-			Buffer.from(endPart)
-		]);
+		const body = Buffer.concat([Buffer.from(metaPart), wavFile, Buffer.from(endPart)]);
 
 		const r = await fetch('https://lumafront.com/database/AI/sale_assistant/webhooks/save_audio.php', {
 			method: 'POST',
@@ -92,9 +123,9 @@ async function uploadAudioToServer(callControlId, role, audioData) {
 			},
 			body
 		});
-		console.log(ts(), 'AUDIO UPLOAD', { role, callControlId, status: r.status, wavBytes: wavFile.length });
+		console.log(ts(), 'AUDIO UPLOAD', { callControlId, status: r.status, wavBytes: wavFile.length });
 	} catch (e) {
-		console.log(ts(), 'AUDIO UPLOAD ERROR', { role, error: e && e.message ? e.message : e });
+		console.log(ts(), 'AUDIO UPLOAD ERROR', e && e.message ? e.message : e);
 	}
 }
 
@@ -241,11 +272,10 @@ wss.on("connection", (telnyxWs, req) => {
 			if (dgWs.readyState === WebSocket.OPEN) {
 				dgWs.send(audio);
 			}
-			// Buffer audio for saving after call ends
-			const bufKey = callControlId + '_' + role;
+			// Buffer audio for mixing after call ends
 			if (callControlId) {
-				if (!audioBuffers[bufKey]) audioBuffers[bufKey] = [];
-				audioBuffers[bufKey].push(audio);
+				if (!audioBuffers[callControlId]) audioBuffers[callControlId] = { Rep: [], Prospect: [], stopped: 0 };
+				audioBuffers[callControlId][role].push(audio);
 			}
 			return;
 		}
@@ -253,12 +283,14 @@ wss.on("connection", (telnyxWs, req) => {
 		if (data.event === "stop") {
 			console.log(ts(), "TELNYX STOP", { role, path, mediaFrames, callControlId });
 
-			// Upload buffered audio to PHP server
-			const bufKey = callControlId + '_' + role;
-			if (audioBuffers[bufKey] && audioBuffers[bufKey].length > 0) {
-				const combined = Buffer.concat(audioBuffers[bufKey]);
-				delete audioBuffers[bufKey];
-				uploadAudioToServer(callControlId, role, combined);
+			// When both tracks have stopped, mix and upload one combined WAV
+			if (audioBuffers[callControlId]) {
+				audioBuffers[callControlId].stopped += 1;
+				if (audioBuffers[callControlId].stopped === 2) {
+					const buf = audioBuffers[callControlId];
+					delete audioBuffers[callControlId];
+					uploadMixedAudio(callControlId, buf.Rep, buf.Prospect);
+				}
 			}
 
 			// Clean up call state after a delay
