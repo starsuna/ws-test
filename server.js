@@ -50,7 +50,7 @@ wss.on("connection", (telnyxWs, req) => {
 
 	const dgUrl =
 		"wss://api.deepgram.com/v1/listen" +
-		"?model=nova-3" +
+		"?model=nova-2-phonecall" +
 		"&encoding=alaw" +
 		"&sample_rate=8000" +
 		"&smart_format=true" +
@@ -106,7 +106,7 @@ wss.on("connection", (telnyxWs, req) => {
 
 		// Overlap if this utterance started before the other person finished
 		// Add 300ms grace period to avoid false overlaps from timing jitter
-		const OVERLAP_GRACE_MS = 300;
+		const OVERLAP_GRACE_MS = 800;
 		const overlap = (utteranceStartWallMs < (otherEndWallMs - OVERLAP_GRACE_MS));
 
 		// Update this role's last speech end time
