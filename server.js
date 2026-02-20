@@ -3,6 +3,14 @@ const WebSocket = require("ws");
 const PORT = process.env.PORT || 10000;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 
+function ts() {
+	return new Date().toISOString();
+}
+
+if (!DEEPGRAM_API_KEY) {
+	console.log(ts(), "FATAL: DEEPGRAM_API_KEY is not set");
+}
+
 const wss = new WebSocket.Server({ port: PORT });
 
 function roleFromPath(path) {
@@ -11,14 +19,23 @@ function roleFromPath(path) {
 	return "Unknown";
 }
 
+console.log(ts(), "WebSocket server listening on", PORT);
+
 wss.on("connection", (telnyxWs, req) => {
-	const path = req.url || "";
+	const path = (req && req.url) ? req.url : (telnyxWs && telnyxWs._path ? telnyxWs._path : "");
 	const role = roleFromPath(path);
 	let callControlId = "";
+	let mediaFrames = 0;
 
-	// Prevent crashes from Telnyx socket errors
-	telnyxWs.on("error", () => {});
-	telnyxWs.on("close", () => {});
+	console.log(ts(), "TELNYX CONNECT", { path, role });
+
+	// Prevent crashes from Telnyx socket errors, but log them
+	telnyxWs.on("error", (e) => {
+		console.log(ts(), "TELNYX WS ERROR", e && e.message ? e.message : e);
+	});
+	telnyxWs.on("close", (code, reason) => {
+		console.log(ts(), "TELNYX CLOSE", { code, reason: reason ? reason.toString() : "" });
+	});
 
 	const dgUrl =
 		"wss://api.deepgram.com/v1/listen" +
@@ -30,12 +47,20 @@ wss.on("connection", (telnyxWs, req) => {
 		"&endpointing=300";
 
 	const dgWs = new WebSocket(dgUrl, {
-		headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }
+		headers: { Authorization: `Token ${DEEPGRAM_API_KEY || ""}` }
 	});
 
-	// Prevent crashes from Deepgram ws errors
-	dgWs.on("error", () => {});
-	dgWs.on("close", () => {});
+	dgWs.on("open", () => {
+		console.log(ts(), "DEEPGRAM OPEN", { role, path });
+	});
+
+	// Log Deepgram errors/closes
+	dgWs.on("error", (e) => {
+		console.log(ts(), "DEEPGRAM WS ERROR", e && e.message ? e.message : e);
+	});
+	dgWs.on("close", (code, reason) => {
+		console.log(ts(), "DEEPGRAM CLOSE", { code, reason: reason ? reason.toString() : "" });
+	});
 
 	dgWs.on("message", async (dgMsg) => {
 		let j;
@@ -57,20 +82,28 @@ wss.on("connection", (telnyxWs, req) => {
 			end = alt.words[alt.words.length - 1].end || 0;
 		}
 
+		const payload = {
+			call_control_id: callControlId,
+			role,
+			text,
+			start,
+			end,
+			is_final: j.is_final || false
+		};
+
 		try {
-			await fetch("https://lumafront.com/database/AI/sale_assistant/webhooks/transcript.php", {
+			const res = await fetch("https://lumafront.com/database/AI/sale_assistant/webhooks/transcript.php", {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
-					call_control_id: callControlId,
-					role,
-					text,
-					start,
-					end,
-					is_final: j.is_final || false
-				})
+				body: JSON.stringify(payload)
 			});
-		} catch {}
+
+			if (!res.ok) {
+				console.log(ts(), "TRANSCRIPT POST BAD STATUS", { status: res.status, role, callControlId });
+			}
+		} catch (e) {
+			console.log(ts(), "TRANSCRIPT POST ERROR", e && e.message ? e.message : e);
+		}
 	});
 
 	telnyxWs.on("message", (msg) => {
@@ -78,14 +111,42 @@ wss.on("connection", (telnyxWs, req) => {
 		try {
 			data = JSON.parse(msg);
 		} catch {
+			console.log(ts(), "TELNYX NON-JSON MESSAGE (ignored)");
 			return;
 		}
 
-		if (data.event === "start" && data.start && data.start.call_control_id) {
-			callControlId = data.start.call_control_id;
+		// Log the first couple messages so we can see the real schema
+		if (mediaFrames === 0 && data && data.event && data.event !== "media") {
+			console.log(ts(), "TELNYX EVENT", data.event, JSON.stringify(data).slice(0, 500));
+		}
+
+		if (data.event === "start") {
+			// Telnyx start payload varies, grab call_control_id from common locations
+			const cc =
+				data?.start?.call_control_id ||
+				data?.call_control_id ||
+				data?.start?.callControlId ||
+				data?.callControlId ||
+				"";
+
+			if (cc && !callControlId) {
+				callControlId = cc;
+				console.log(ts(), "CALL CONTROL ID SET", { callControlId, role, path });
+			} else if (!cc) {
+				console.log(ts(), "WARNING: start event missing call_control_id", { role, path });
+			}
 		}
 
 		if (data.event === "media" && data.media && data.media.payload) {
+			mediaFrames += 1;
+
+			// occasional progress log
+			if (mediaFrames === 1) {
+				console.log(ts(), "FIRST MEDIA FRAME", { role, path, hasCallControlId: !!callControlId });
+			} else if (mediaFrames % 200 === 0) {
+				console.log(ts(), "MEDIA FRAMES", { role, path, mediaFrames, hasCallControlId: !!callControlId });
+			}
+
 			const audio = Buffer.from(data.media.payload, "base64");
 			if (dgWs.readyState === WebSocket.OPEN) {
 				dgWs.send(audio);
@@ -93,16 +154,19 @@ wss.on("connection", (telnyxWs, req) => {
 		}
 
 		if (data.event === "stop") {
+			console.log(ts(), "TELNYX STOP", { role, path, mediaFrames, callControlId });
+
 			try {
 				if (dgWs.readyState === WebSocket.OPEN) {
 					dgWs.send(JSON.stringify({ type: "Finalize" }));
 				}
-			} catch {}
+			} catch (e) {
+				console.log(ts(), "DEEPGRAM FINALIZE ERROR", e && e.message ? e.message : e);
+			}
+
 			try {
 				dgWs.close();
 			} catch {}
 		}
 	});
 });
-
-console.log("WebSocket server running on port", PORT);
