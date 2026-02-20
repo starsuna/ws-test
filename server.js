@@ -9,8 +9,8 @@ function ts() {
 }
 
 function roleFromPath(path) {
-	if (path === "/in") return "Prospect";  // inbound = audio from the person you called
-	if (path === "/out") return "Rep";       // outbound = your voice from Zoiper
+	if (path === "/in") return "Rep";       // inbound = your voice from Zoiper
+	if (path === "/out") return "Prospect";  // outbound = audio from the person you called
 	return "Unknown";
 }
 
@@ -283,22 +283,7 @@ wss.on("connection", (telnyxWs, req) => {
 		if (data.event === "stop") {
 			console.log(ts(), "TELNYX STOP", { role, path, mediaFrames, callControlId });
 
-			// When both tracks have stopped, mix and upload one combined WAV
-			if (audioBuffers[callControlId]) {
-				audioBuffers[callControlId].stopped += 1;
-				if (audioBuffers[callControlId].stopped === 2) {
-					const buf = audioBuffers[callControlId];
-					delete audioBuffers[callControlId];
-					uploadMixedAudio(callControlId, buf.Rep, buf.Prospect);
-				}
-			}
-
-			// Clean up call state after a delay
-			setTimeout(() => {
-				if (callSpeechTimes[callControlId]) {
-					delete callSpeechTimes[callControlId];
-				}
-			}, 10000);
+			// Send Finalize to Deepgram and wait 2s for last transcript before closing
 			try {
 				if (dgWs.readyState === WebSocket.OPEN) {
 					dgWs.send(JSON.stringify({ type: "Finalize" }));
@@ -306,7 +291,39 @@ wss.on("connection", (telnyxWs, req) => {
 			} catch (e) {
 				console.log(ts(), "DEEPGRAM FINALIZE ERROR", e && e.message ? e.message : e);
 			}
-			try { dgWs.close(); } catch {}
+
+			// Wait 2 seconds for Deepgram to flush final transcript, then handle audio
+			setTimeout(() => {
+				try { dgWs.close(); } catch {}
+
+				// Mix and upload audio - use a shared completion tracker
+				if (!audioBuffers[callControlId]) return;
+				audioBuffers[callControlId].stopped += 1;
+
+				const doUpload = () => {
+					const buf = audioBuffers[callControlId];
+					if (!buf) return;
+					delete audioBuffers[callControlId];
+					uploadMixedAudio(callControlId, buf.Rep, buf.Prospect);
+				};
+
+				if (audioBuffers[callControlId].stopped === 2) {
+					// Both tracks done - upload now
+					doUpload();
+				} else {
+					// Wait up to 3 more seconds for the other track
+					setTimeout(() => {
+						if (audioBuffers[callControlId]) doUpload();
+					}, 3000);
+				}
+
+				// Clean up speech times
+				setTimeout(() => {
+					if (callSpeechTimes[callControlId]) {
+						delete callSpeechTimes[callControlId];
+					}
+				}, 5000);
+			}, 2000);
 			return;
 		}
 	});
