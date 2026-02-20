@@ -31,6 +31,73 @@ const wss = new WebSocket.Server({ noServer: true });
 // Key: callControlId, Value: { Rep: wallMs, Prospect: wallMs }
 const callSpeechTimes = {};
 
+// Buffer raw PCMA audio per call per role for saving after call ends
+// Key: callControlId_role, Value: array of Buffer chunks
+const audioBuffers = {};
+
+function makeWavHeader(dataLength, sampleRate = 8000, channels = 1) {
+	// WAV header for PCMA (G.711 A-law), 8-bit samples
+	const header = Buffer.alloc(44);
+	const fileSize = dataLength + 36;
+	header.write('RIFF', 0);
+	header.writeUInt32LE(fileSize, 4);
+	header.write('WAVE', 8);
+	header.write('fmt ', 12);
+	header.writeUInt32LE(16, 16);           // chunk size
+	header.writeUInt16LE(6, 20);            // PCM A-law = 6
+	header.writeUInt16LE(channels, 22);
+	header.writeUInt32LE(sampleRate, 24);
+	header.writeUInt32LE(sampleRate * channels, 28); // byte rate
+	header.writeUInt16LE(channels, 32);     // block align
+	header.writeUInt16LE(8, 34);            // bits per sample
+	header.write('data', 36);
+	header.writeUInt32LE(dataLength, 40);
+	return header;
+}
+
+async function uploadAudioToServer(callControlId, role, audioData) {
+	if (!audioData || audioData.length === 0) return;
+	try {
+		const wavHeader = makeWavHeader(audioData.length);
+		const wavFile   = Buffer.concat([wavHeader, audioData]);
+
+		// Build multipart form manually
+		const boundary = '----FormBoundary' + Date.now();
+		const CRLF = '\r\n';
+
+		const metaPart =
+			'--' + boundary + CRLF +
+			'Content-Disposition: form-data; name="call_control_id"' + CRLF + CRLF +
+			callControlId + CRLF +
+			'--' + boundary + CRLF +
+			'Content-Disposition: form-data; name="role"' + CRLF + CRLF +
+			role + CRLF +
+			'--' + boundary + CRLF +
+			'Content-Disposition: form-data; name="audio"; filename="audio.wav"' + CRLF +
+			'Content-Type: audio/wav' + CRLF + CRLF;
+
+		const endPart = CRLF + '--' + boundary + '--' + CRLF;
+
+		const body = Buffer.concat([
+			Buffer.from(metaPart),
+			wavFile,
+			Buffer.from(endPart)
+		]);
+
+		const r = await fetch('https://lumafront.com/database/AI/sale_assistant/webhooks/save_audio.php', {
+			method: 'POST',
+			headers: {
+				'Content-Type': 'multipart/form-data; boundary=' + boundary,
+				'Content-Length': body.length
+			},
+			body
+		});
+		console.log(ts(), 'AUDIO UPLOAD', { role, callControlId, status: r.status, wavBytes: wavFile.length });
+	} catch (e) {
+		console.log(ts(), 'AUDIO UPLOAD ERROR', { role, error: e && e.message ? e.message : e });
+	}
+}
+
 wss.on("connection", (telnyxWs, req) => {
 	const path = (req && req.url) ? req.url : "";
 	const role = roleFromPath(path);
@@ -174,11 +241,26 @@ wss.on("connection", (telnyxWs, req) => {
 			if (dgWs.readyState === WebSocket.OPEN) {
 				dgWs.send(audio);
 			}
+			// Buffer audio for saving after call ends
+			const bufKey = callControlId + '_' + role;
+			if (callControlId) {
+				if (!audioBuffers[bufKey]) audioBuffers[bufKey] = [];
+				audioBuffers[bufKey].push(audio);
+			}
 			return;
 		}
 
 		if (data.event === "stop") {
 			console.log(ts(), "TELNYX STOP", { role, path, mediaFrames, callControlId });
+
+			// Upload buffered audio to PHP server
+			const bufKey = callControlId + '_' + role;
+			if (audioBuffers[bufKey] && audioBuffers[bufKey].length > 0) {
+				const combined = Buffer.concat(audioBuffers[bufKey]);
+				delete audioBuffers[bufKey];
+				uploadAudioToServer(callControlId, role, combined);
+			}
+
 			// Clean up call state after a delay
 			setTimeout(() => {
 				if (callSpeechTimes[callControlId]) {
