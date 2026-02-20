@@ -7,36 +7,54 @@ const TRANSCRIPT_ENDPOINT = "https://lumafront.com/database/AI/sale_assistant/we
 
 const port = process.env.PORT || 10000;
 
-function postToLumafront(obj) {
+function postJson(obj) {
 	const payload = JSON.stringify(obj);
-	console.log("POST_TRY", payload.slice(0, 200));
-
 	const req = https.request(TRANSCRIPT_ENDPOINT, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
 			"Content-Length": Buffer.byteLength(payload),
-			"User-Agent": "render-telnyx-forwarder"
+			"User-Agent": "telnyx-deepgram-forwarder"
 		},
 		timeout: 5000
 	}, (res) => {
-		console.log("POST_RES", res.statusCode);
-		let body = "";
-		res.on("data", (d) => body += d.toString("utf8"));
-		res.on("end", () => console.log("POST_BODY", body.slice(0, 200)));
+		res.resume();
 	});
-
-	req.on("timeout", () => {
-		console.log("POST_ERR", "timeout");
-		req.destroy();
-	});
-
-	req.on("error", (e) => {
-		console.log("POST_ERR", e.message);
-	});
-
+	req.on("timeout", () => req.destroy());
+	req.on("error", () => {});
 	req.write(payload);
 	req.end();
+}
+
+function wordsToSpeakerLines(words) {
+	// words: [{word, speaker, start, end}, ...]
+	const lines = [];
+	let curSpeaker = null;
+	let cur = [];
+
+	for (const w of words || []) {
+		const sp = (w && w.speaker !== undefined) ? w.speaker : null;
+		const txt = (w && w.word) ? String(w.word) : "";
+		if (!txt) continue;
+
+		if (curSpeaker === null) {
+			curSpeaker = sp;
+		}
+
+		if (sp !== curSpeaker) {
+			const line = cur.join(" ").trim();
+			if (line) lines.push({ speaker: curSpeaker, text: line });
+			curSpeaker = sp;
+			cur = [txt];
+		} else {
+			cur.push(txt);
+		}
+	}
+
+	const last = cur.join(" ").trim();
+	if (last) lines.push({ speaker: curSpeaker, text: last });
+
+	return lines;
 }
 
 const server = http.createServer((req, res) => {
@@ -47,31 +65,28 @@ const server = http.createServer((req, res) => {
 const wss = new WebSocket.Server({ server });
 
 wss.on("connection", (telnyxWs) => {
+	let callControlId = "";
+	let dgReady = false;
 
-	console.log("TELNYX_WS_CONNECTED");
+	// Speed-first model, diarization enabled (adds cost)
+	const dgUrl =
+		"wss://api.deepgram.com/v1/listen" +
+		"?model=flux" +
+		"&encoding=alaw" +
+		"&sample_rate=8000" +
+		"&diarize=true" +
+		"&smart_format=true" +
+		"&interim_results=true";
 
-	if (!DEEPGRAM_API_KEY) {
-		console.log("FATAL", "DEEPGRAM_API_KEY missing");
-	}
-
-	const dgUrl = "wss://api.deepgram.com/v1/listen?encoding=alaw&sample_rate=8000&channels=1&punctuate=true&diarize=true";
 	const dgWs = new WebSocket(dgUrl, {
 		headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }
 	});
 
-	dgWs.on("open", () => console.log("DEEPGRAM_CONNECTED"));
-	dgWs.on("close", (c, r) => console.log("DEEPGRAM_CLOSED", c, (r || "").toString()));
-	dgWs.on("error", (e) => console.log("DEEPGRAM_ERROR", e.message));
-
-	let mediaCount = 0;
-	let dgMsgCount = 0;
+	dgWs.on("open", () => {
+		dgReady = true;
+	});
 
 	dgWs.on("message", (dgMsg) => {
-		dgMsgCount++;
-		if (dgMsgCount <= 3) {
-			console.log("DEEPGRAM_MSG_SAMPLE", dgMsg.toString("utf8").slice(0, 250));
-		}
-
 		let j;
 		try {
 			j = JSON.parse(dgMsg.toString("utf8"));
@@ -80,73 +95,77 @@ wss.on("connection", (telnyxWs) => {
 		}
 
 		const alt = j?.channel?.alternatives?.[0];
-		const transcript = alt?.transcript || "";
-		if (!transcript) return;
+		const transcript = (alt?.transcript || "").trim();
+		const isFinal = !!j?.is_final;
 
-		console.log("DG_TRANSCRIPT", transcript);
-		postToLumafront({
-			ts: Date.now(),
-			transcript,
-			is_final: j?.is_final ?? null,
-			confidence: alt?.confidence ?? null
-		});
-	});
+		// We only post finals to reduce spam/latency load on your PHP
+		if (!isFinal || !transcript) return;
 
-	telnyxWs.on("message", (msg) => {
+		const words = alt?.words || [];
+		const speakerLines = wordsToSpeakerLines(words);
 
-		// Telnyx may send JSON frames with base64 audio
-		if (!Buffer.isBuffer(msg)) {
-			let j;
-			try {
-				j = JSON.parse(msg.toString("utf8"));
-			} catch {
-				console.log("TELNYX_TEXT_NONJSON", msg.toString("utf8").slice(0, 200));
-				return;
-			}
-
-			if (j.event === "connected") {
-				console.log("TELNYX_EVENT", "connected");
-				return;
-			}
-
-			if (j.event === "start") {
-				console.log("TELNYX_EVENT", "start");
-				console.log("TELNYX_START_KEYS", Object.keys(j));
-				return;
-			}
-
-			if (j.event === "media" && j.media && typeof j.media.payload === "string") {
-				mediaCount++;
-				if (mediaCount <= 3) console.log("TELNYX_MEDIA_SAMPLE_LEN", j.media.payload.length);
-
-				const audio = Buffer.from(j.media.payload, "base64");
-				if (dgWs.readyState === WebSocket.OPEN) {
-					dgWs.send(audio);
-				}
-				return;
-			}
-
-			if (j.event === "stop") {
-				console.log("TELNYX_EVENT", "stop");
-				return;
-			}
-
-			console.log("TELNYX_JSON_OTHER", Object.keys(j));
+		// If diarization didn’t label words (rare), fall back to unknown speaker
+		if (!speakerLines.length) {
+			postJson({
+				call_control_id: callControlId,
+				speaker: null,
+				text: transcript,
+				is_final: true
+			});
 			return;
 		}
 
-		// If Telnyx sends binary, forward it
-		if (dgWs.readyState === WebSocket.OPEN) {
-			dgWs.send(msg);
+		for (const line of speakerLines) {
+			postJson({
+				call_control_id: callControlId,
+				speaker: line.speaker,
+				text: line.text,
+				is_final: true
+			});
+		}
+	});
+
+	telnyxWs.on("message", (msg) => {
+		if (Buffer.isBuffer(msg)) {
+			// If Telnyx sends binary, forward directly
+			if (dgReady) dgWs.send(msg);
+			return;
+		}
+
+		let j;
+		try {
+			j = JSON.parse(msg.toString("utf8"));
+		} catch {
+			return;
+		}
+
+		// Telnyx sends audio as base64 RTP payload wrapped in JSON "media" events
+		// :contentReference[oaicite:3]{index=3}
+		if (j.event === "start") {
+			callControlId = j?.start?.call_control_id || callControlId;
+			return;
+		}
+
+		if (j.event === "media" && j.media && typeof j.media.payload === "string") {
+			const audio = Buffer.from(j.media.payload, "base64");
+			if (dgReady) dgWs.send(audio);
+			return;
+		}
+
+		if (j.event === "stop") {
+			try {
+				dgWs.close();
+			} catch {}
 		}
 	});
 
 	telnyxWs.on("close", () => {
-		console.log("TELNYX_WS_CLOSED", "mediaCount=" + mediaCount, "dgMsgCount=" + dgMsgCount);
-		if (dgWs.readyState === WebSocket.OPEN) dgWs.close();
+		try {
+			dgWs.close();
+		} catch {}
 	});
-
-	telnyxWs.on("error", (e) => console.log("TELNYX_WS_ERROR", e.message));
 });
 
-server.listen(port, () => console.log("Listening on", port));
+server.listen(port, () => {
+	console.log("Listening on", port);
+});
