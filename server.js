@@ -2,7 +2,6 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 10000;
-
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
 
 function ts() {
@@ -11,7 +10,7 @@ function ts() {
 
 function roleFromPath(path) {
 	if (path === "/in") return "Prospect";  // inbound = audio from the person you called
-	if (path === "/out") return "Rep";       // outbound = your voice going out
+	if (path === "/out") return "Rep";       // outbound = your voice from Zoiper
 	return "Unknown";
 }
 
@@ -28,12 +27,17 @@ const server = http.createServer(async (req, res) => {
 
 const wss = new WebSocket.Server({ noServer: true });
 
+// Track last-speech end time per call, per role, using WALL CLOCK time
+// Key: callControlId, Value: { Rep: wallMs, Prospect: wallMs }
+const callSpeechTimes = {};
+
 wss.on("connection", (telnyxWs, req) => {
 	const path = (req && req.url) ? req.url : "";
 	const role = roleFromPath(path);
 
 	let callControlId = "";
 	let mediaFrames = 0;
+	let callStartWallMs = Date.now(); // when this WS connection opened
 
 	console.log(ts(), "TELNYX CONNECT", { path, role });
 
@@ -44,16 +48,15 @@ wss.on("connection", (telnyxWs, req) => {
 		console.log(ts(), "TELNYX CLOSE", { code, reason: reason ? reason.toString() : "" });
 	});
 
-	// PCMA = G.711 A-law, confirmed from Telnyx STREAM START logs
 	const dgUrl =
 		"wss://api.deepgram.com/v1/listen" +
-		"?model=nova-2" +
+		"?model=nova-3" +
 		"&encoding=alaw" +
 		"&sample_rate=8000" +
 		"&smart_format=true" +
 		"&interim_results=true" +
-		"&endpointing=200" +
-		"&utterance_end_ms=1000";
+		"&endpointing=150" +
+		"&utterance_end_ms=800";
 
 	const dgWs = new WebSocket(dgUrl, {
 		headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }
@@ -71,36 +74,58 @@ wss.on("connection", (telnyxWs, req) => {
 
 	dgWs.on("message", async (dgMsg) => {
 		let j;
-		try {
-			j = JSON.parse(dgMsg);
-		} catch {
-			return;
-		}
+		try { j = JSON.parse(dgMsg); } catch { return; }
 
-		// Only post final transcripts to reduce PHP load
+		// Only process final transcripts
 		if (!j.is_final) return;
 
 		const alt = j?.channel?.alternatives?.[0];
 		const text = alt?.transcript;
 		if (!text || text.trim() === "") return;
 
-		let start = 0;
-		let end = 0;
+		// Use wall clock time for overlap detection
+		// Deepgram's start/end are relative to the utterance, not the call
+		// So we use actual real-world time instead
+		const nowMs = Date.now();
+
+		// Duration of this utterance from Deepgram word timestamps
+		let utteranceDurationMs = 0;
 		if (alt.words && alt.words.length > 0) {
-			start = alt.words[0].start || 0;
-			end = alt.words[alt.words.length - 1].end || 0;
+			const dgStart = alt.words[0].start || 0;
+			const dgEnd   = alt.words[alt.words.length - 1].end || 0;
+			utteranceDurationMs = Math.round((dgEnd - dgStart) * 1000);
 		}
+
+		// Estimate when this utterance started in wall time
+		const utteranceStartWallMs = nowMs - utteranceDurationMs;
+		const utteranceEndWallMs   = nowMs;
+
+		// Check overlap against the other role
+		const otherRole = (role === "Rep") ? "Prospect" : "Rep";
+		const callTimes = callSpeechTimes[callControlId] || {};
+		const otherEndWallMs = callTimes[otherRole] || 0;
+
+		// Overlap if this utterance started before the other person finished
+		// Add 300ms grace period to avoid false overlaps from timing jitter
+		const OVERLAP_GRACE_MS = 300;
+		const overlap = (utteranceStartWallMs < (otherEndWallMs - OVERLAP_GRACE_MS));
+
+		// Update this role's last speech end time
+		if (!callSpeechTimes[callControlId]) callSpeechTimes[callControlId] = {};
+		callSpeechTimes[callControlId][role] = utteranceEndWallMs;
 
 		const payload = {
 			call_control_id: callControlId,
 			role,
 			text,
-			start,
-			end,
+			overlap,
+			// Send wall-clock based times as seconds-since-call-start
+			start: (utteranceStartWallMs - callStartWallMs) / 1000,
+			end:   (utteranceEndWallMs   - callStartWallMs) / 1000,
 			is_final: true
 		};
 
-		console.log(ts(), "TRANSCRIPT", { role, text, callControlId });
+		console.log(ts(), "TRANSCRIPT", { role, text, overlap, callControlId });
 
 		try {
 			const r = await fetch("https://lumafront.com/database/AI/sale_assistant/webhooks/transcript.php", {
@@ -108,7 +133,9 @@ wss.on("connection", (telnyxWs, req) => {
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify(payload)
 			});
-			console.log(ts(), "TRANSCRIPT POST STATUS", { status: r.status, role });
+			if (!r.ok) {
+				console.log(ts(), "TRANSCRIPT POST BAD STATUS", { status: r.status });
+			}
 		} catch (e) {
 			console.log(ts(), "TRANSCRIPT POST ERROR", e && e.message ? e.message : e);
 		}
@@ -116,14 +143,9 @@ wss.on("connection", (telnyxWs, req) => {
 
 	telnyxWs.on("message", (msg) => {
 		let data;
-		try {
-			data = JSON.parse(msg);
-		} catch {
-			return;
-		}
+		try { data = JSON.parse(msg); } catch { return; }
 
 		if (data.event === "connected") {
-			console.log(ts(), "TELNYX CONNECTED EVENT", { role });
 			return;
 		}
 
@@ -132,13 +154,11 @@ wss.on("connection", (telnyxWs, req) => {
 				data?.start?.call_control_id ||
 				data?.call_control_id ||
 				"";
-
 			if (cc && !callControlId) {
 				callControlId = cc;
+				callStartWallMs = Date.now();
 				console.log(ts(), "CALL CONTROL ID SET", { callControlId, role, path });
 			}
-
-			// Log the actual encoding Telnyx is sending
 			const encoding = data?.start?.media_format?.encoding || "unknown";
 			console.log(ts(), "STREAM START", { role, encoding, callControlId });
 			return;
@@ -146,13 +166,11 @@ wss.on("connection", (telnyxWs, req) => {
 
 		if (data.event === "media" && data.media && data.media.payload) {
 			mediaFrames += 1;
-
 			if (mediaFrames === 1) {
 				console.log(ts(), "FIRST MEDIA FRAME", { role, path, hasCallControlId: !!callControlId });
 			} else if (mediaFrames % 500 === 0) {
 				console.log(ts(), "MEDIA FRAMES", { role, mediaFrames });
 			}
-
 			const audio = Buffer.from(data.media.payload, "base64");
 			if (dgWs.readyState === WebSocket.OPEN) {
 				dgWs.send(audio);
@@ -162,6 +180,12 @@ wss.on("connection", (telnyxWs, req) => {
 
 		if (data.event === "stop") {
 			console.log(ts(), "TELNYX STOP", { role, path, mediaFrames, callControlId });
+			// Clean up call state after a delay
+			setTimeout(() => {
+				if (callSpeechTimes[callControlId]) {
+					delete callSpeechTimes[callControlId];
+				}
+			}, 10000);
 			try {
 				if (dgWs.readyState === WebSocket.OPEN) {
 					dgWs.send(JSON.stringify({ type: "Finalize" }));
@@ -188,7 +212,5 @@ server.on("upgrade", (req, socket, head) => {
 
 server.listen(PORT, () => {
 	console.log(ts(), "HTTP+WS listening on", PORT);
-	console.log(ts(), "ENV", {
-		hasDeepgramKey: !!DEEPGRAM_API_KEY
-	});
+	console.log(ts(), "ENV", { hasDeepgramKey: !!DEEPGRAM_API_KEY });
 });
