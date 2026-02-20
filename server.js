@@ -13,48 +13,29 @@ function postJson(obj) {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
-			"Content-Length": Buffer.byteLength(payload),
-			"User-Agent": "telnyx-deepgram-forwarder"
+			"Content-Length": Buffer.byteLength(payload)
 		},
 		timeout: 5000
-	}, (res) => {
-		res.resume();
-	});
+	}, (res) => res.resume());
+
 	req.on("timeout", () => req.destroy());
 	req.on("error", () => {});
 	req.write(payload);
 	req.end();
 }
 
-function wordsToSpeakerLines(words) {
-	// words: [{word, speaker, start, end}, ...]
-	const lines = [];
-	let curSpeaker = null;
-	let cur = [];
+function roleFromPath(pathname) {
+	// IMPORTANT: if labels come out swapped, just swap these two strings.
+	if (pathname === "/in") return "Rep";
+	if (pathname === "/out") return "Prospect";
+	return "Unknown";
+}
 
-	for (const w of words || []) {
-		const sp = (w && w.speaker !== undefined) ? w.speaker : null;
-		const txt = (w && w.word) ? String(w.word) : "";
-		if (!txt) continue;
-
-		if (curSpeaker === null) {
-			curSpeaker = sp;
-		}
-
-		if (sp !== curSpeaker) {
-			const line = cur.join(" ").trim();
-			if (line) lines.push({ speaker: curSpeaker, text: line });
-			curSpeaker = sp;
-			cur = [txt];
-		} else {
-			cur.push(txt);
-		}
-	}
-
-	const last = cur.join(" ").trim();
-	if (last) lines.push({ speaker: curSpeaker, text: last });
-
-	return lines;
+function segmentTimesFromWords(words) {
+	if (!Array.isArray(words) || words.length === 0) return { start: null, end: null };
+	const start = (words[0] && typeof words[0].start === "number") ? words[0].start : null;
+	const end = (words[words.length - 1] && typeof words[words.length - 1].end === "number") ? words[words.length - 1].end : null;
+	return { start, end };
 }
 
 const server = http.createServer((req, res) => {
@@ -62,28 +43,30 @@ const server = http.createServer((req, res) => {
 	res.end("ok\n");
 });
 
-const wss = new WebSocket.Server({ server });
+const wss = new WebSocket.Server({ noServer: true });
+
+server.on("upgrade", (req, socket, head) => {
+	const path = (req.url || "/").split("?")[0];
+	wss.handleUpgrade(req, socket, head, (ws) => {
+		ws._path = path;
+		wss.emit("connection", ws, req);
+	});
+});
 
 wss.on("connection", (telnyxWs) => {
+	const role = roleFromPath(telnyxWs._path);
 	let callControlId = "";
-	let dgReady = false;
 
-	// Speed-first model, diarization enabled (adds cost)
 	const dgUrl =
 		"wss://api.deepgram.com/v1/listen" +
 		"?model=flux" +
 		"&encoding=alaw" +
 		"&sample_rate=8000" +
-		"&diarize=true" +
 		"&smart_format=true" +
 		"&interim_results=true";
 
 	const dgWs = new WebSocket(dgUrl, {
 		headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }
-	});
-
-	dgWs.on("open", () => {
-		dgReady = true;
 	});
 
 	dgWs.on("message", (dgMsg) => {
@@ -96,39 +79,27 @@ wss.on("connection", (telnyxWs) => {
 
 		const alt = j?.channel?.alternatives?.[0];
 		const transcript = (alt?.transcript || "").trim();
-		const isFinal = !!j?.is_final;
+		if (!transcript) return;
 
-		// We only post finals to reduce spam/latency load on your PHP
-		if (!isFinal || !transcript) return;
+		const isFinal = !!j?.is_final;
+		if (!isFinal) return;
 
 		const words = alt?.words || [];
-		const speakerLines = wordsToSpeakerLines(words);
+		const seg = segmentTimesFromWords(words);
 
-		// If diarization didn’t label words (rare), fall back to unknown speaker
-		if (!speakerLines.length) {
-			postJson({
-				call_control_id: callControlId,
-				speaker: null,
-				text: transcript,
-				is_final: true
-			});
-			return;
-		}
-
-		for (const line of speakerLines) {
-			postJson({
-				call_control_id: callControlId,
-				speaker: line.speaker,
-				text: line.text,
-				is_final: true
-			});
-		}
+		postJson({
+			call_control_id: callControlId,
+			role,
+			text: transcript,
+			start: seg.start,
+			end: seg.end,
+			is_final: true
+		});
 	});
 
 	telnyxWs.on("message", (msg) => {
 		if (Buffer.isBuffer(msg)) {
-			// If Telnyx sends binary, forward directly
-			if (dgReady) dgWs.send(msg);
+			if (dgWs.readyState === WebSocket.OPEN) dgWs.send(msg);
 			return;
 		}
 
@@ -139,8 +110,6 @@ wss.on("connection", (telnyxWs) => {
 			return;
 		}
 
-		// Telnyx sends audio as base64 RTP payload wrapped in JSON "media" events
-		// :contentReference[oaicite:3]{index=3}
 		if (j.event === "start") {
 			callControlId = j?.start?.call_control_id || callControlId;
 			return;
@@ -148,21 +117,17 @@ wss.on("connection", (telnyxWs) => {
 
 		if (j.event === "media" && j.media && typeof j.media.payload === "string") {
 			const audio = Buffer.from(j.media.payload, "base64");
-			if (dgReady) dgWs.send(audio);
+			if (dgWs.readyState === WebSocket.OPEN) dgWs.send(audio);
 			return;
 		}
 
 		if (j.event === "stop") {
-			try {
-				dgWs.close();
-			} catch {}
+			try { dgWs.close(); } catch {}
 		}
 	});
 
 	telnyxWs.on("close", () => {
-		try {
-			dgWs.close();
-		} catch {}
+		try { dgWs.close(); } catch {}
 	});
 });
 
