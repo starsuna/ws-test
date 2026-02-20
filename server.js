@@ -50,13 +50,12 @@ wss.on("connection", (telnyxWs, req) => {
 
 	const dgUrl =
 		"wss://api.deepgram.com/v1/listen" +
-		"?model=nova-3-general" +
+		"?model=nova-3" +
 		"&encoding=alaw" +
 		"&sample_rate=8000" +
 		"&smart_format=true" +
 		"&interim_results=true" +
-		"&endpointing=150" +
-		"&utterance_end_ms=800";
+		"&endpointing=150";
 
 	const dgWs = new WebSocket(dgUrl, {
 		headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }
