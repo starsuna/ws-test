@@ -1,3 +1,4 @@
+const http = require("http");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 10000;
@@ -7,29 +8,39 @@ function ts() {
 	return new Date().toISOString();
 }
 
-if (!DEEPGRAM_API_KEY) {
-	console.log(ts(), "FATAL: DEEPGRAM_API_KEY is not set");
-}
-
-const wss = new WebSocket.Server({ port: PORT });
-
 function roleFromPath(path) {
 	if (path === "/in") return "Rep";
 	if (path === "/out") return "Prospect";
 	return "Unknown";
 }
 
-console.log(ts(), "WebSocket server listening on", PORT);
+if (!DEEPGRAM_API_KEY) {
+	console.log(ts(), "FATAL: DEEPGRAM_API_KEY is not set");
+}
+
+// Render expects an HTTP listener, attach WebSocket to it
+const server = http.createServer((req, res) => {
+	if (req.url === "/health" || req.url === "/") {
+		res.writeHead(200, { "Content-Type": "text/plain" });
+		res.end("ok");
+		return;
+	}
+	res.writeHead(404, { "Content-Type": "text/plain" });
+	res.end("not found");
+});
+
+const wss = new WebSocket.Server({ server });
+
+console.log(ts(), "HTTP+WS listening on", PORT);
 
 wss.on("connection", (telnyxWs, req) => {
-	const path = (req && req.url) ? req.url : (telnyxWs && telnyxWs._path ? telnyxWs._path : "");
+	const path = (req && req.url) ? req.url : "";
 	const role = roleFromPath(path);
 	let callControlId = "";
 	let mediaFrames = 0;
 
 	console.log(ts(), "TELNYX CONNECT", { path, role });
 
-	// Prevent crashes from Telnyx socket errors, but log them
 	telnyxWs.on("error", (e) => {
 		console.log(ts(), "TELNYX WS ERROR", e && e.message ? e.message : e);
 	});
@@ -54,7 +65,6 @@ wss.on("connection", (telnyxWs, req) => {
 		console.log(ts(), "DEEPGRAM OPEN", { role, path });
 	});
 
-	// Log Deepgram errors/closes
 	dgWs.on("error", (e) => {
 		console.log(ts(), "DEEPGRAM WS ERROR", e && e.message ? e.message : e);
 	});
@@ -115,13 +125,7 @@ wss.on("connection", (telnyxWs, req) => {
 			return;
 		}
 
-		// Log the first couple messages so we can see the real schema
-		if (mediaFrames === 0 && data && data.event && data.event !== "media") {
-			console.log(ts(), "TELNYX EVENT", data.event, JSON.stringify(data).slice(0, 500));
-		}
-
 		if (data.event === "start") {
-			// Telnyx start payload varies, grab call_control_id from common locations
 			const cc =
 				data?.start?.call_control_id ||
 				data?.call_control_id ||
@@ -140,7 +144,6 @@ wss.on("connection", (telnyxWs, req) => {
 		if (data.event === "media" && data.media && data.media.payload) {
 			mediaFrames += 1;
 
-			// occasional progress log
 			if (mediaFrames === 1) {
 				console.log(ts(), "FIRST MEDIA FRAME", { role, path, hasCallControlId: !!callControlId });
 			} else if (mediaFrames % 200 === 0) {
@@ -169,4 +172,8 @@ wss.on("connection", (telnyxWs, req) => {
 			} catch {}
 		}
 	});
+});
+
+server.listen(PORT, () => {
+	console.log(ts(), "SERVER READY");
 });
