@@ -44,11 +44,11 @@ wss.on("connection", (telnyxWs, req) => {
 		console.log(ts(), "TELNYX CLOSE", { code, reason: reason ? reason.toString() : "" });
 	});
 
-	// PCMU = G.711 mu-law, which is what Telnyx sends
+	// PCMA = G.711 A-law, confirmed from Telnyx STREAM START logs
 	const dgUrl =
 		"wss://api.deepgram.com/v1/listen" +
 		"?model=nova-2" +
-		"&encoding=mulaw" +
+		"&encoding=alaw" +
 		"&sample_rate=8000" +
 		"&smart_format=true" +
 		"&interim_results=true" +
