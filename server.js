@@ -255,6 +255,15 @@ wss.on("connection", (telnyxWs, req) => {
 				callControlId = cc;
 				callStartWallMs = Date.now();
 				console.log(ts(), "CALL CONTROL ID SET", { callControlId, role, path });
+
+				// Move any pre-buffered audio from pending key to real callControlId key
+				const pendingKey = 'pending_' + path;
+				if (audioBuffers[pendingKey]) {
+					if (!audioBuffers[callControlId]) audioBuffers[callControlId] = { Rep: [], Prospect: [], stopped: 0 };
+					audioBuffers[callControlId][role].push(...audioBuffers[pendingKey][role]);
+					delete audioBuffers[pendingKey];
+					console.log(ts(), "MERGED PENDING AUDIO", { role, chunks: audioBuffers[callControlId][role].length });
+				}
 			}
 			const encoding = data?.start?.media_format?.encoding || "unknown";
 			console.log(ts(), "STREAM START", { role, encoding, callControlId });
@@ -272,11 +281,10 @@ wss.on("connection", (telnyxWs, req) => {
 			if (dgWs.readyState === WebSocket.OPEN) {
 				dgWs.send(audio);
 			}
-			// Buffer audio for mixing after call ends
-			if (callControlId) {
-				if (!audioBuffers[callControlId]) audioBuffers[callControlId] = { Rep: [], Prospect: [], stopped: 0 };
-				audioBuffers[callControlId][role].push(audio);
-			}
+			// Buffer audio always - use temp key until callControlId is known
+			const bufKey = callControlId || ('pending_' + path);
+			if (!audioBuffers[bufKey]) audioBuffers[bufKey] = { Rep: [], Prospect: [], stopped: 0 };
+			audioBuffers[bufKey][role].push(audio);
 			return;
 		}
 
@@ -292,7 +300,7 @@ wss.on("connection", (telnyxWs, req) => {
 				console.log(ts(), "DEEPGRAM FINALIZE ERROR", e && e.message ? e.message : e);
 			}
 
-			// Wait 2 seconds for Deepgram to flush final transcript, then handle audio
+			// Wait 4 seconds for Deepgram to flush final transcript, then handle audio
 			setTimeout(() => {
 				try { dgWs.close(); } catch {}
 
@@ -323,7 +331,7 @@ wss.on("connection", (telnyxWs, req) => {
 						delete callSpeechTimes[callControlId];
 					}
 				}, 5000);
-			}, 2000);
+			}, 4000);
 			return;
 		}
 	});
