@@ -50,7 +50,7 @@ wss.on("connection", (telnyxWs, req) => {
 
 	const dgUrl =
 		"wss://api.deepgram.com/v1/listen" +
-		"?model=nova-3" +
+		"?model=nova-3-general" +
 		"&encoding=alaw" +
 		"&sample_rate=8000" +
 		"&smart_format=true" +
