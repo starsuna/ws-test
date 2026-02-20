@@ -1,5 +1,4 @@
 const WebSocket = require("ws");
-const fetch = require("node-fetch");
 
 const PORT = process.env.PORT || 10000;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
@@ -13,7 +12,7 @@ function roleFromPath(path) {
 }
 
 wss.on("connection", (telnyxWs, req) => {
-	const path = req.url;
+	const path = req.url || "";
 	const role = roleFromPath(path);
 	let callControlId = "";
 
@@ -34,7 +33,7 @@ wss.on("connection", (telnyxWs, req) => {
 		headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` }
 	});
 
-	// Prevent crashes from Deepgram socket errors
+	// Prevent crashes from Deepgram ws errors
 	dgWs.on("error", () => {});
 	dgWs.on("close", () => {});
 
@@ -46,10 +45,8 @@ wss.on("connection", (telnyxWs, req) => {
 			return;
 		}
 
-		if (!j.channel || !j.channel.alternatives || !j.channel.alternatives[0]) return;
-
-		const alt = j.channel.alternatives[0];
-		const text = alt.transcript;
+		const alt = j?.channel?.alternatives?.[0];
+		const text = alt?.transcript;
 		if (!text || text.trim() === "") return;
 
 		let start = 0;
