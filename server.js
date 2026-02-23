@@ -47,13 +47,18 @@ function buildStereoWav(repFrames, prospectFrames) {
 	// Stereo interleaved PCM buffer (L=Rep, R=Prospect)
 	const pcm = Buffer.alloc(totalSamples * CHANNELS * BYTES_PER_SAMPLE, 0);
 
+	// Apply gain to boost volume (A-law decoded PCM is often too quiet)
+	const GAIN = 6.0; // 6x amplification - adjust if too loud/quiet
+
 	function writeFrames(frames, channel) {
 		for (const { ts, audio } of frames) {
 			const startSample = Math.floor(ts * SAMPLE_RATE / 1000);
 			for (let i = 0; i < audio.length; i++) {
-				const sample     = ALAW_DECODE[audio[i]];
+				const raw        = ALAW_DECODE[audio[i]];
+				// Apply gain and clamp to 16-bit range
+				const amplified  = Math.max(-32768, Math.min(32767, Math.round(raw * GAIN)));
 				const byteOffset = ((startSample + i) * CHANNELS + channel) * BYTES_PER_SAMPLE;
-				if (byteOffset + 1 < pcm.length) pcm.writeInt16LE(sample, byteOffset);
+				if (byteOffset + 1 < pcm.length) pcm.writeInt16LE(amplified, byteOffset);
 			}
 		}
 	}
