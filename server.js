@@ -17,66 +17,90 @@ const callSpeechTimes = {}; // callControlId -> { Rep: ms, Prospect: ms }
 const audioBuffers    = {}; // callControlId -> { Rep: [], Prospect: [], stopped: 0 }
 
 // ── WAV / audio helpers ─────────────────────────────────────────
-function makeWavHeader(dataLength, sampleRate = 8000, channels = 1) {
-	const header = Buffer.alloc(44);
-	header.write("RIFF", 0);
-	header.writeUInt32LE(dataLength + 36, 4);
-	header.write("WAVE", 8);
-	header.write("fmt ", 12);
-	header.writeUInt32LE(16, 16);
-	header.writeUInt16LE(6, 20);            // 6 = PCMA / A-law
-	header.writeUInt16LE(channels, 22);
-	header.writeUInt32LE(sampleRate, 24);
-	header.writeUInt32LE(sampleRate * channels, 28);
-	header.writeUInt16LE(channels, 32);
-	header.writeUInt16LE(8, 34);
-	header.write("data", 36);
-	header.writeUInt32LE(dataLength, 40);
-	return header;
-}
-
-function mixAlaw(repBuf, prospectBuf) {
-	const alawDecode = new Int16Array(256);
+// A-law decode table (256 entries -> 16-bit PCM)
+const ALAW_DECODE = (() => {
+	const t = new Int16Array(256);
 	for (let i = 0; i < 256; i++) {
 		let val = i ^ 0x55;
 		let seg = (val & 0x70) >> 4;
-		let t = (val & 0x0F) << 1 | 1;
-		if (seg) t = (t + 32) << (seg - 1);
-		alawDecode[i] = (val & 0x80) ? t : -t;
+		let s = (val & 0x0F) << 1 | 1;
+		if (seg) s = (s + 32) << (seg - 1);
+		t[i] = (val & 0x80) ? s : -s;
 	}
-	const len = Math.max(repBuf.length, prospectBuf.length);
-	const mixed = Buffer.alloc(len);
-	for (let i = 0; i < len; i++) {
-		const s1 = i < repBuf.length      ? alawDecode[repBuf[i]]      : 0;
-		const s2 = i < prospectBuf.length ? alawDecode[prospectBuf[i]] : 0;
-		let sum = Math.max(-32768, Math.min(32767, s1 + s2));
-		const sign = (sum >= 0) ? 0x80 : 0x00;
-		if (sum < 0) sum = -sum;
-		let enc;
-		if      (sum <= 31)   enc = (sum >> 1);
-		else if (sum <= 63)   enc = ((sum - 32) >> 1) | 0x10;
-		else if (sum <= 127)  enc = ((sum - 64) >> 2) | 0x20;
-		else if (sum <= 255)  enc = ((sum - 128) >> 3) | 0x30;
-		else if (sum <= 511)  enc = ((sum - 256) >> 4) | 0x40;
-		else if (sum <= 1023) enc = ((sum - 512) >> 5) | 0x50;
-		else if (sum <= 2047) enc = ((sum - 1024) >> 6) | 0x60;
-		else if (sum <= 4095) enc = ((sum - 2048) >> 7) | 0x70;
-		else                  enc = 0x7F;
-		mixed[i] = (enc | sign) ^ 0x55;
+	return t;
+})();
+
+// Build a stereo (2-channel) 16-bit PCM WAV
+// Left channel = Rep, Right channel = Prospect
+// Frames are placed by their Telnyx timestamp (milliseconds)
+// Each frame = 20ms = 160 samples @ 8000Hz
+function buildStereoWav(repFrames, prospectFrames) {
+	const SAMPLE_RATE   = 8000;
+	const SAMPLES_20MS  = 160; // 20ms at 8kHz
+	const BYTES_PER_SAMPLE = 2; // 16-bit PCM
+	const CHANNELS      = 2;
+
+	// Find total duration from last timestamp + 20ms
+	let maxTs = 0;
+	for (const f of repFrames)      if (f.ts > maxTs) maxTs = f.ts;
+	for (const f of prospectFrames) if (f.ts > maxTs) maxTs = f.ts;
+	const totalMs      = maxTs + 20;
+	const totalSamples = Math.ceil(totalMs * SAMPLE_RATE / 1000);
+
+	// Allocate stereo interleaved buffer (L,R,L,R...)
+	const pcm = Buffer.alloc(totalSamples * CHANNELS * BYTES_PER_SAMPLE, 0);
+
+	function writeFrames(frames, channel) { // channel: 0=Left(Rep), 1=Right(Prospect)
+		for (const { ts, audio } of frames) {
+			const startSample = Math.floor(ts * SAMPLE_RATE / 1000);
+			for (let i = 0; i < audio.length; i++) {
+				const sample     = ALAW_DECODE[audio[i]];
+				const sampleIdx  = startSample + i;
+				const byteOffset = (sampleIdx * CHANNELS + channel) * BYTES_PER_SAMPLE;
+				if (byteOffset + 1 < pcm.length) {
+					pcm.writeInt16LE(sample, byteOffset);
+				}
+			}
+		}
 	}
-	return mixed;
+
+	writeFrames(repFrames,      0); // Left  = Rep
+	writeFrames(prospectFrames, 1); // Right = Prospect
+
+	// Build stereo WAV header
+	const dataBytes = pcm.length;
+	const header = Buffer.alloc(44);
+	header.write("RIFF", 0);
+	header.writeUInt32LE(dataBytes + 36, 4);
+	header.write("WAVE", 8);
+	header.write("fmt ", 12);
+	header.writeUInt32LE(16, 16);
+	header.writeUInt16LE(1, 20);                          // PCM = 1
+	header.writeUInt16LE(CHANNELS, 22);
+	header.writeUInt32LE(SAMPLE_RATE, 24);
+	header.writeUInt32LE(SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE, 28);
+	header.writeUInt16LE(CHANNELS * BYTES_PER_SAMPLE, 32);
+	header.writeUInt16LE(16, 34);
+	header.write("data", 36);
+	header.writeUInt32LE(dataBytes, 40);
+
+	return Buffer.concat([header, pcm]);
 }
 
-async function uploadMixedAudio(callControlId, repChunks, prospectChunks) {
+async function uploadMixedAudio(callControlId, repFrames, prospectFrames) {
 	try {
-		const repBuf      = Buffer.concat(repChunks      || []);
-		const prospectBuf = Buffer.concat(prospectChunks || []);
-		if (repBuf.length === 0 && prospectBuf.length === 0) return;
+		if (repFrames.length === 0 && prospectFrames.length === 0) {
+			console.log(ts(), "AUDIO UPLOAD SKIPPED - no frames", { callControlId });
+			return;
+		}
 
-		const mixedPcm  = mixAlaw(repBuf, prospectBuf);
-		const wavFile   = Buffer.concat([makeWavHeader(mixedPcm.length), mixedPcm]);
-
-		console.log(ts(), "AUDIO MIX", { callControlId, repBytes: repBuf.length, prospectBytes: prospectBuf.length, wavBytes: wavFile.length });
+		const wavFile = buildStereoWav(repFrames, prospectFrames);
+		console.log(ts(), "AUDIO BUILD", {
+			callControlId,
+			repFrames:      repFrames.length,
+			prospectFrames: prospectFrames.length,
+			wavBytes:       wavFile.length
+		});
 
 		const boundary = "----FormBoundary" + Date.now();
 		const CRLF = "\r\n";
@@ -92,10 +116,13 @@ async function uploadMixedAudio(callControlId, repChunks, prospectChunks) {
 
 		const r = await fetch("https://lumafront.com/database/AI/sale_assistant/webhooks/save_audio.php", {
 			method: "POST",
-			headers: { "Content-Type": "multipart/form-data; boundary=" + boundary, "Content-Length": body.length },
+			headers: {
+				"Content-Type":  "multipart/form-data; boundary=" + boundary,
+				"Content-Length": body.length
+			},
 			body
 		});
-		console.log(ts(), "AUDIO UPLOAD STATUS", r.status);
+		console.log(ts(), "AUDIO UPLOAD STATUS", r.status, { wavBytes: wavFile.length });
 	} catch (e) {
 		console.log(ts(), "AUDIO UPLOAD ERROR", e && e.message ? e.message : e);
 	}
@@ -201,7 +228,8 @@ wss.on("connection", (telnyxWs, req) => {
 				callStartWallMs = Date.now();
 				console.log(ts(), "CALL CONTROL ID SET", { callControlId, path });
 
-				// Merge pre-buffered audio
+				// Merge pre-buffered frames (these had ts=0 before callControlId known - still correct
+				// because Telnyx timestamps are relative to stream start, not wall clock)
 				const pk = "pending_" + path;
 				if (audioBuffers[pk]) {
 					if (!audioBuffers[callControlId]) audioBuffers[callControlId] = { Rep: [], Prospect: [], stopped: 0 };
@@ -227,10 +255,14 @@ wss.on("connection", (telnyxWs, req) => {
 			const dg = (role === "Rep") ? dgRep : dgProspect;
 			if (dg.readyState === WebSocket.OPEN) dg.send(audio);
 
-			// Buffer for recording
-			const bufKey = callControlId || ("pending_" + path);
+			// Buffer for recording - store with Telnyx timestamp for exact alignment
+			// Telnyx timestamp is in milliseconds from call start
+			const frameTs  = parseInt(data.media.timestamp || "0", 10);
+			const bufKey   = callControlId || ("pending_" + path);
 			if (!audioBuffers[bufKey]) audioBuffers[bufKey] = { Rep: [], Prospect: [], stopped: 0 };
-			if (role === "Rep" || role === "Prospect") audioBuffers[bufKey][role].push(audio);
+			if (role === "Rep" || role === "Prospect") {
+				audioBuffers[bufKey][role].push({ ts: frameTs, audio });
+			}
 			return;
 		}
 
