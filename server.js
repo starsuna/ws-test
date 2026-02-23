@@ -196,6 +196,7 @@ wss.on("connection", (telnyxWs, req) => {
 	let callControlId   = "";
 	let callStartWallMs = Date.now();
 	let mediaFrames     = 0;
+	let firstRtpTs      = null; // first RTP timestamp seen on this connection
 
 	const getCC  = () => callControlId;
 	const getCSW = () => callStartWallMs;
@@ -237,8 +238,11 @@ wss.on("connection", (telnyxWs, req) => {
 			mediaFrames++;
 			if (mediaFrames === 1) console.log(ts(), "FIRST MEDIA FRAME", { role, path });
 
-			const audio   = Buffer.from(data.media.payload, "base64");
-			const frameTs = parseInt(data.media.timestamp || "0", 10);
+			const audio      = Buffer.from(data.media.payload, "base64");
+			const rawRtpTs   = parseInt(data.media.timestamp || "0", 10);
+			// RTP timestamp counts at 8000Hz - convert to milliseconds from call start
+			if (firstRtpTs === null) firstRtpTs = rawRtpTs;
+			const frameTs = Math.round((rawRtpTs - firstRtpTs) / 8);
 
 			// Send to Deepgram for transcription
 			if (dg.readyState === WebSocket.OPEN) dg.send(audio);
