@@ -6,18 +6,17 @@ const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
 
 function ts() { return new Date().toISOString(); }
 
-function trackToRole(track) {
-	if (track === "inbound")  return "Rep";
-	if (track === "outbound") return "Prospect";
+function roleFromPath(path) {
+	if (path === "/in")  return "Rep";
+	if (path === "/out") return "Prospect";
 	return "Unknown";
 }
 
-// ── Shared state ────────────────────────────────────────────────
+// ── Shared call state ────────────────────────────────────────────
 const callSpeechTimes = {}; // callControlId -> { Rep: ms, Prospect: ms }
-const audioBuffers    = {}; // callControlId -> { Rep: [], Prospect: [], stopped: 0 }
+const audioBuffers    = {}; // callControlId -> { Rep: [{ts,audio}], Prospect: [{ts,audio}], stopped: 0 }
 
-// ── WAV / audio helpers ─────────────────────────────────────────
-// A-law decode table (256 entries -> 16-bit PCM)
+// ── A-law decode table ───────────────────────────────────────────
 const ALAW_DECODE = (() => {
 	const t = new Int16Array(256);
 	for (let i = 0; i < 256; i++) {
@@ -30,36 +29,31 @@ const ALAW_DECODE = (() => {
 	return t;
 })();
 
-// Build a stereo (2-channel) 16-bit PCM WAV
+// ── Build stereo WAV using Telnyx timestamps (no guessing) ───────
 // Left channel = Rep, Right channel = Prospect
-// Frames are placed by their Telnyx timestamp (milliseconds)
-// Each frame = 20ms = 160 samples @ 8000Hz
+// Each frame placed at its exact timestamp from Telnyx
 function buildStereoWav(repFrames, prospectFrames) {
-	const SAMPLE_RATE   = 8000;
-	const SAMPLES_20MS  = 160; // 20ms at 8kHz
+	const SAMPLE_RATE      = 8000;
+	const CHANNELS         = 2;
 	const BYTES_PER_SAMPLE = 2; // 16-bit PCM
-	const CHANNELS      = 2;
 
-	// Find total duration from last timestamp + 20ms
+	// Find total duration
 	let maxTs = 0;
 	for (const f of repFrames)      if (f.ts > maxTs) maxTs = f.ts;
 	for (const f of prospectFrames) if (f.ts > maxTs) maxTs = f.ts;
-	const totalMs      = maxTs + 20;
+	const totalMs      = maxTs + 20; // +20ms for last frame
 	const totalSamples = Math.ceil(totalMs * SAMPLE_RATE / 1000);
 
-	// Allocate stereo interleaved buffer (L,R,L,R...)
+	// Stereo interleaved PCM buffer (L=Rep, R=Prospect)
 	const pcm = Buffer.alloc(totalSamples * CHANNELS * BYTES_PER_SAMPLE, 0);
 
-	function writeFrames(frames, channel) { // channel: 0=Left(Rep), 1=Right(Prospect)
+	function writeFrames(frames, channel) {
 		for (const { ts, audio } of frames) {
 			const startSample = Math.floor(ts * SAMPLE_RATE / 1000);
 			for (let i = 0; i < audio.length; i++) {
 				const sample     = ALAW_DECODE[audio[i]];
-				const sampleIdx  = startSample + i;
-				const byteOffset = (sampleIdx * CHANNELS + channel) * BYTES_PER_SAMPLE;
-				if (byteOffset + 1 < pcm.length) {
-					pcm.writeInt16LE(sample, byteOffset);
-				}
+				const byteOffset = ((startSample + i) * CHANNELS + channel) * BYTES_PER_SAMPLE;
+				if (byteOffset + 1 < pcm.length) pcm.writeInt16LE(sample, byteOffset);
 			}
 		}
 	}
@@ -67,62 +61,58 @@ function buildStereoWav(repFrames, prospectFrames) {
 	writeFrames(repFrames,      0); // Left  = Rep
 	writeFrames(prospectFrames, 1); // Right = Prospect
 
-	// Build stereo WAV header
-	const dataBytes = pcm.length;
+	// WAV header - stereo 16-bit PCM
 	const header = Buffer.alloc(44);
 	header.write("RIFF", 0);
-	header.writeUInt32LE(dataBytes + 36, 4);
+	header.writeUInt32LE(pcm.length + 36, 4);
 	header.write("WAVE", 8);
 	header.write("fmt ", 12);
 	header.writeUInt32LE(16, 16);
-	header.writeUInt16LE(1, 20);                          // PCM = 1
+	header.writeUInt16LE(1, 20);   // PCM
 	header.writeUInt16LE(CHANNELS, 22);
 	header.writeUInt32LE(SAMPLE_RATE, 24);
 	header.writeUInt32LE(SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE, 28);
 	header.writeUInt16LE(CHANNELS * BYTES_PER_SAMPLE, 32);
 	header.writeUInt16LE(16, 34);
 	header.write("data", 36);
-	header.writeUInt32LE(dataBytes, 40);
+	header.writeUInt32LE(pcm.length, 40);
 
 	return Buffer.concat([header, pcm]);
 }
 
-async function uploadMixedAudio(callControlId, repFrames, prospectFrames) {
+async function uploadAudio(callControlId, repFrames, prospectFrames) {
 	try {
-		if (repFrames.length === 0 && prospectFrames.length === 0) {
-			console.log(ts(), "AUDIO UPLOAD SKIPPED - no frames", { callControlId });
-			return;
-		}
+		if (!repFrames.length && !prospectFrames.length) return;
 
 		const wavFile = buildStereoWav(repFrames, prospectFrames);
 		console.log(ts(), "AUDIO BUILD", {
 			callControlId,
-			repFrames:      repFrames.length,
+			repFrames: repFrames.length,
 			prospectFrames: prospectFrames.length,
-			wavBytes:       wavFile.length
+			wavBytes: wavFile.length
 		});
 
-		const boundary = "----FormBoundary" + Date.now();
-		const CRLF = "\r\n";
-		const metaPart =
+		const boundary = "----Boundary" + Date.now();
+		const CRLF     = "\r\n";
+		const meta     =
 			"--" + boundary + CRLF +
 			'Content-Disposition: form-data; name="call_control_id"' + CRLF + CRLF +
 			callControlId + CRLF +
 			"--" + boundary + CRLF +
 			'Content-Disposition: form-data; name="audio"; filename="audio.wav"' + CRLF +
 			"Content-Type: audio/wav" + CRLF + CRLF;
-		const endPart = CRLF + "--" + boundary + "--" + CRLF;
-		const body = Buffer.concat([Buffer.from(metaPart), wavFile, Buffer.from(endPart)]);
+		const end  = CRLF + "--" + boundary + "--" + CRLF;
+		const body = Buffer.concat([Buffer.from(meta), wavFile, Buffer.from(end)]);
 
 		const r = await fetch("https://lumafront.com/database/AI/sale_assistant/webhooks/save_audio.php", {
 			method: "POST",
 			headers: {
-				"Content-Type":  "multipart/form-data; boundary=" + boundary,
+				"Content-Type":   "multipart/form-data; boundary=" + boundary,
 				"Content-Length": body.length
 			},
 			body
 		});
-		console.log(ts(), "AUDIO UPLOAD STATUS", r.status, { wavBytes: wavFile.length });
+		console.log(ts(), "AUDIO UPLOAD", r.status, { bytes: wavFile.length });
 	} catch (e) {
 		console.log(ts(), "AUDIO UPLOAD ERROR", e && e.message ? e.message : e);
 	}
@@ -142,7 +132,7 @@ function makeDgWs(role, getCC, getCSW) {
 	const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
 	dg.on("open",  ()    => console.log(ts(), "DEEPGRAM OPEN",  { role }));
 	dg.on("error", (e)   => console.log(ts(), "DEEPGRAM ERROR", { role, err: e && e.message ? e.message : e }));
-	dg.on("close", (c,r) => console.log(ts(), "DEEPGRAM CLOSE", { role, code: c, reason: r ? r.toString() : "" }));
+	dg.on("close", (c,r) => console.log(ts(), "DEEPGRAM CLOSE", { role, code: c }));
 
 	dg.on("message", async (raw) => {
 		let j; try { j = JSON.parse(raw); } catch { return; }
@@ -158,9 +148,9 @@ function makeDgWs(role, getCC, getCSW) {
 
 		let durMs = 0;
 		if (alt.words && alt.words.length > 0) {
-			durMs = Math.round(((alt.words[alt.words.length-1].end || 0) - (alt.words[0].start || 0)) * 1000);
+			durMs = Math.round(((alt.words[alt.words.length-1].end||0) - (alt.words[0].start||0)) * 1000);
 		}
-		const startMs = nowMs - durMs;
+		const startMs   = nowMs - durMs;
 		const otherRole = role === "Rep" ? "Prospect" : "Rep";
 		if (!callSpeechTimes[callControlId]) callSpeechTimes[callControlId] = {};
 		const otherEnd = callSpeechTimes[callControlId][otherRole] || 0;
@@ -180,13 +170,15 @@ function makeDgWs(role, getCC, getCSW) {
 					is_final: true
 				})
 			});
-		} catch (e) { console.log(ts(), "TRANSCRIPT POST ERROR", e && e.message ? e.message : e); }
+		} catch (e) {
+			console.log(ts(), "TRANSCRIPT POST ERROR", e && e.message ? e.message : e);
+		}
 	});
 
 	return dg;
 }
 
-// ── HTTP server ──────────────────────────────────────────────────
+// ── HTTP ─────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
 	if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
 		res.writeHead(200); res.end("ok"); return;
@@ -194,12 +186,12 @@ const server = http.createServer((req, res) => {
 	res.writeHead(404); res.end("not found");
 });
 
-// ── WebSocket server ─────────────────────────────────────────────
+// ── WebSocket ─────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ noServer: true });
 
 wss.on("connection", (telnyxWs, req) => {
 	const path = (req && req.url) ? req.url : "";
-	console.log(ts(), "TELNYX CONNECT", { path });
+	const role = roleFromPath(path);
 
 	let callControlId   = "";
 	let callStartWallMs = Date.now();
@@ -208,13 +200,13 @@ wss.on("connection", (telnyxWs, req) => {
 	const getCC  = () => callControlId;
 	const getCSW = () => callStartWallMs;
 
-	// Create TWO Deepgram connections — one per track (Rep=inbound, Prospect=outbound)
-	// This guarantees correct speaker separation regardless of which endpoint Telnyx uses
-	const dgRep      = makeDgWs("Rep",      getCC, getCSW);
-	const dgProspect = makeDgWs("Prospect", getCC, getCSW);
+	// One Deepgram connection per WebSocket (one per track)
+	const dg = makeDgWs(role, getCC, getCSW);
+
+	console.log(ts(), "TELNYX CONNECT", { path, role });
 
 	telnyxWs.on("error", (e)   => console.log(ts(), "TELNYX ERROR", e && e.message ? e.message : e));
-	telnyxWs.on("close", (c,r) => console.log(ts(), "TELNYX CLOSE", { code: c }));
+	telnyxWs.on("close", (c)   => console.log(ts(), "TELNYX CLOSE", { code: c, role }));
 
 	telnyxWs.on("message", (msg) => {
 		let data; try { data = JSON.parse(msg); } catch { return; }
@@ -226,85 +218,65 @@ wss.on("connection", (telnyxWs, req) => {
 			if (cc && !callControlId) {
 				callControlId   = cc;
 				callStartWallMs = Date.now();
-				console.log(ts(), "CALL CONTROL ID SET", { callControlId, path });
+				console.log(ts(), "CALL CONTROL ID SET", { callControlId, role });
 
-				// Merge pre-buffered frames (these had ts=0 before callControlId known - still correct
-				// because Telnyx timestamps are relative to stream start, not wall clock)
+				// Merge any pre-buffered audio frames
 				const pk = "pending_" + path;
 				if (audioBuffers[pk]) {
 					if (!audioBuffers[callControlId]) audioBuffers[callControlId] = { Rep: [], Prospect: [], stopped: 0 };
-					audioBuffers[callControlId].Rep.push(...(audioBuffers[pk].Rep || []));
-					audioBuffers[callControlId].Prospect.push(...(audioBuffers[pk].Prospect || []));
+					audioBuffers[callControlId][role].push(...audioBuffers[pk][role]);
 					delete audioBuffers[pk];
-					console.log(ts(), "MERGED PENDING AUDIO", { path });
+					console.log(ts(), "MERGED PENDING AUDIO", { role, frames: audioBuffers[callControlId][role].length });
 				}
 			}
-			console.log(ts(), "STREAM START", { encoding: data?.start?.media_format?.encoding, callControlId });
+			console.log(ts(), "STREAM START", { role, encoding: data?.start?.media_format?.encoding });
 			return;
 		}
 
 		if (data.event === "media" && data.media && data.media.payload) {
 			mediaFrames++;
-			const track = data.media.track || "inbound";
-			const role  = trackToRole(track);
-			const audio = Buffer.from(data.media.payload, "base64");
+			if (mediaFrames === 1) console.log(ts(), "FIRST MEDIA FRAME", { role, path });
 
-			if (mediaFrames === 1) console.log(ts(), "FIRST MEDIA FRAME", { path, track, role });
+			const audio   = Buffer.from(data.media.payload, "base64");
+			const frameTs = parseInt(data.media.timestamp || "0", 10);
 
-			// Route audio to the correct Deepgram connection
-			const dg = (role === "Rep") ? dgRep : dgProspect;
+			// Send to Deepgram for transcription
 			if (dg.readyState === WebSocket.OPEN) dg.send(audio);
 
-			// Buffer for recording - store with Telnyx timestamp for exact alignment
-			// Telnyx timestamp is in milliseconds from call start
-			const frameTs  = parseInt(data.media.timestamp || "0", 10);
-			const bufKey   = callControlId || ("pending_" + path);
+			// Buffer with exact Telnyx timestamp for audio recording
+			const bufKey = callControlId || ("pending_" + path);
 			if (!audioBuffers[bufKey]) audioBuffers[bufKey] = { Rep: [], Prospect: [], stopped: 0 };
-			if (role === "Rep" || role === "Prospect") {
-				audioBuffers[bufKey][role].push({ ts: frameTs, audio });
-			}
+			audioBuffers[bufKey][role].push({ ts: frameTs, audio });
 			return;
 		}
 
 		if (data.event === "stop") {
-			console.log(ts(), "TELNYX STOP", { path, mediaFrames, callControlId });
+			console.log(ts(), "TELNYX STOP", { role, mediaFrames, callControlId });
 
-			// Finalize Deepgram - flush last transcript
-			[dgRep, dgProspect].forEach(dg => {
-				try { if (dg.readyState === WebSocket.OPEN) dg.send(JSON.stringify({ type: "Finalize" })); } catch {}
-			});
+			// Finalize Deepgram - wait 4s for last transcript then upload audio
+			try { if (dg.readyState === WebSocket.OPEN) dg.send(JSON.stringify({ type: "Finalize" })); } catch {}
 
-			// Wait 4s for Deepgram to return final transcript, then close and upload
 			setTimeout(() => {
-				[dgRep, dgProspect].forEach(dg => { try { dg.close(); } catch {} });
+				try { dg.close(); } catch {}
 
 				if (!audioBuffers[callControlId]) return;
 				audioBuffers[callControlId].stopped += 1;
-				console.log(ts(), "TRACK STOPPED", { path, stopped: audioBuffers[callControlId].stopped, callControlId });
 
 				const doUpload = () => {
 					const buf = audioBuffers[callControlId];
 					if (!buf) return;
 					delete audioBuffers[callControlId];
-					// Upload stereo WAV - Rep frames on left, Prospect frames on right
-					// Each frame placed at its exact Telnyx timestamp - zero guessing
-					uploadMixedAudio(callControlId, buf.Rep, buf.Prospect);
+					uploadAudio(callControlId, buf.Rep, buf.Prospect);
+					setTimeout(() => { delete callSpeechTimes[callControlId]; }, 5000);
 				};
 
+				// Two WS connections (/in and /out) so wait for stopped===2
 				if (audioBuffers[callControlId].stopped >= 2) {
-					// Both /in and /out tracks have stopped - upload now
 					doUpload();
 				} else {
-					// Wait up to 5s for the other track to finish
-					setTimeout(() => {
-						if (audioBuffers[callControlId]) {
-							console.log(ts(), "TIMEOUT UPLOAD - other track did not stop", { callControlId });
-							doUpload();
-						}
-					}, 5000);
+					// Safety: if other track doesn't stop within 5s, upload anyway
+					setTimeout(() => { if (audioBuffers[callControlId]) doUpload(); }, 5000);
 				}
-
-				setTimeout(() => { if (callSpeechTimes[callControlId]) delete callSpeechTimes[callControlId]; }, 10000);
 			}, 4000);
 			return;
 		}
@@ -313,10 +285,7 @@ wss.on("connection", (telnyxWs, req) => {
 
 server.on("upgrade", (req, socket, head) => {
 	const url = req.url || "";
-	// Accept /in, /out, and /both (new primary endpoint)
-	if (url !== "/in" && url !== "/out" && url !== "/both") {
-		socket.destroy(); return;
-	}
+	if (url !== "/in" && url !== "/out") { socket.destroy(); return; }
 	wss.handleUpgrade(req, socket, head, (ws) => wss.emit("connection", ws, req));
 });
 
