@@ -269,30 +269,42 @@ wss.on("connection", (telnyxWs, req) => {
 		if (data.event === "stop") {
 			console.log(ts(), "TELNYX STOP", { path, mediaFrames, callControlId });
 
-			// Finalize both Deepgram streams
+			// Finalize Deepgram - flush last transcript
 			[dgRep, dgProspect].forEach(dg => {
 				try { if (dg.readyState === WebSocket.OPEN) dg.send(JSON.stringify({ type: "Finalize" })); } catch {}
 			});
 
-			// Wait 4s for final transcripts, then upload audio
+			// Wait 4s for Deepgram to return final transcript, then close and upload
 			setTimeout(() => {
 				[dgRep, dgProspect].forEach(dg => { try { dg.close(); } catch {} });
 
 				if (!audioBuffers[callControlId]) return;
 				audioBuffers[callControlId].stopped += 1;
+				console.log(ts(), "TRACK STOPPED", { path, stopped: audioBuffers[callControlId].stopped, callControlId });
 
 				const doUpload = () => {
 					const buf = audioBuffers[callControlId];
 					if (!buf) return;
 					delete audioBuffers[callControlId];
+					// Upload stereo WAV - Rep frames on left, Prospect frames on right
+					// Each frame placed at its exact Telnyx timestamp - zero guessing
 					uploadMixedAudio(callControlId, buf.Rep, buf.Prospect);
 				};
 
-				// Each call now has only ONE Telnyx WS connection (using /both or single track)
-				// so stopped===1 means done. Use timeout as safety net.
-				doUpload();
+				if (audioBuffers[callControlId].stopped >= 2) {
+					// Both /in and /out tracks have stopped - upload now
+					doUpload();
+				} else {
+					// Wait up to 5s for the other track to finish
+					setTimeout(() => {
+						if (audioBuffers[callControlId]) {
+							console.log(ts(), "TIMEOUT UPLOAD - other track did not stop", { callControlId });
+							doUpload();
+						}
+					}, 5000);
+				}
 
-				setTimeout(() => { if (callSpeechTimes[callControlId]) delete callSpeechTimes[callControlId]; }, 5000);
+				setTimeout(() => { if (callSpeechTimes[callControlId]) delete callSpeechTimes[callControlId]; }, 10000);
 			}, 4000);
 			return;
 		}
