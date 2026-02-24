@@ -126,7 +126,7 @@ function makeDgWs(role, getCC, getCSW) {
 		"&sample_rate=8000" +
 		"&smart_format=true" +
 		"&interim_results=true" +
-		"&endpointing=150";
+		"&endpointing=10";
 
 	const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
 	dg.on("open",  ()  => console.log(ts(), "DEEPGRAM OPEN",  { role }));
