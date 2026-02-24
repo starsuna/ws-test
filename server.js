@@ -312,6 +312,7 @@ wss.on("connection", (telnyxWs, req) => {
 					if (!buf) return;
 					delete audioBuffers[callControlId];
 					uploadAudio(callControlId, buf.Rep, buf.Prospect);
+					saveCost(callControlId, buf.Rep.length, buf.Prospect.length);
 					setTimeout(() => { delete callSpeechTimes[callControlId]; }, 5000);
 				};
 
