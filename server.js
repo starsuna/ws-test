@@ -183,6 +183,42 @@ function makeDgWs(role, getCC, getCSW) {
 	return dg;
 }
 
+// ── Deepgram cost calculation ────────────────────────────────────
+// nova-2-phonecall: $0.0043 per minute (as of 2024)
+const DG_COST_PER_MIN = 0.0043;
+
+async function saveCost(callControlId, repFrameCount, prospectFrameCount) {
+	try {
+		// Each frame = 20ms of audio. Two separate DG connections (Rep + Prospect)
+		const repMs       = repFrameCount      * 20;
+		const prospectMs  = prospectFrameCount * 20;
+		const totalMs     = repMs + prospectMs;
+		const totalMin    = totalMs / 1000 / 60;
+		// Deepgram bills each stream separately, rounded up to nearest second
+		const repMin      = Math.ceil(repMs      / 1000) / 60;
+		const prospectMin = Math.ceil(prospectMs / 1000) / 60;
+		const cost        = ((repMin + prospectMin) * DG_COST_PER_MIN);
+
+		const payload = {
+			call_control_id: callControlId,
+			rep_seconds:      Math.round(repMs      / 1000),
+			prospect_seconds: Math.round(prospectMs / 1000),
+			total_seconds:    Math.round(totalMs    / 1000),
+			cost_usd:         parseFloat(cost.toFixed(6))
+		};
+
+		console.log(ts(), "DEEPGRAM COST", payload);
+
+		await fetch("https://lumafront.com/database/AI/sale_assistant/webhooks/save_cost.php", {
+			method:  "POST",
+			headers: { "Content-Type": "application/json" },
+			body:    JSON.stringify(payload)
+		});
+	} catch (e) {
+		console.log(ts(), "SAVE COST ERROR", e && e.message ? e.message : e);
+	}
+}
+
 // ── HTTP ─────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
 	if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
