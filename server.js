@@ -15,6 +15,7 @@ function roleFromPath(path) {
 
 const callSpeechTimes = {};
 const audioBuffers    = {};
+const suggestTimers   = {};
 
 const ALAW_DECODE = (() => {
 	const t = new Int16Array(256);
@@ -174,9 +175,8 @@ function makeDgWs(role, getCC, getCSW) {
 		// Debounce: wait 1500ms after last prospect chunk before firing suggest
 		// This prevents mid-sentence triggers when endpointing splits speech into chunks
 		if (role === "Prospect" && !overlap && text.split(' ').length >= 2) {
-			if (!global.suggestTimers) global.suggestTimers = {};
-			clearTimeout(global.suggestTimers[callControlId]);
-			global.suggestTimers[callControlId] = setTimeout(() => {
+			clearTimeout(suggestTimers[callControlId]);
+			suggestTimers[callControlId] = setTimeout(() => {
 				fetch(PHP_BASE + "/suggest.php", {
 					method:  "POST",
 					headers: { "Content-Type": "application/json" },
