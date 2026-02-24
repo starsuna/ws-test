@@ -126,7 +126,7 @@ function makeDgWs(role, getCC, getCSW) {
 		"&sample_rate=8000" +
 		"&smart_format=true" +
 		"&interim_results=true" +
-		"&endpointing=10";
+		"&endpointing=50";
 
 	const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
 	dg.on("open",  ()  => console.log(ts(), "DEEPGRAM OPEN",  { role }));
@@ -171,13 +171,18 @@ function makeDgWs(role, getCC, getCSW) {
 		}
 
 		// Trigger AI suggestion only after genuine Prospect utterances
-		// Skip if overlap (audio bleed from rep) or text too short to be meaningful
+		// Debounce: wait 1500ms after last prospect chunk before firing suggest
+		// This prevents mid-sentence triggers when endpointing splits speech into chunks
 		if (role === "Prospect" && !overlap && text.split(' ').length >= 2) {
-			fetch(PHP_BASE + "/suggest.php", {
-				method:  "POST",
-				headers: { "Content-Type": "application/json" },
-				body:    JSON.stringify({ call_control_id: callControlId })
-			}).catch(e => console.log(ts(), "SUGGEST TRIGGER ERROR", e && e.message ? e.message : e));
+			if (!global.suggestTimers) global.suggestTimers = {};
+			clearTimeout(global.suggestTimers[callControlId]);
+			global.suggestTimers[callControlId] = setTimeout(() => {
+				fetch(PHP_BASE + "/suggest.php", {
+					method:  "POST",
+					headers: { "Content-Type": "application/json" },
+					body:    JSON.stringify({ call_control_id: callControlId })
+				}).catch(e => console.log(ts(), "SUGGEST TRIGGER ERROR", e && e.message ? e.message : e));
+			}, 1500);
 		}
 	});
 
