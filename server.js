@@ -1,8 +1,9 @@
 const http = require("http");
 const WebSocket = require("ws");
 
-const PORT = process.env.PORT || 10000;
+const PORT             = process.env.PORT || 10000;
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY || "";
+const PHP_BASE         = "https://lumafront.com/database/AI/sale_assistant/webhooks";
 
 function ts() { return new Date().toISOString(); }
 
@@ -12,68 +13,50 @@ function roleFromPath(path) {
 	return "Unknown";
 }
 
-// ── Shared call state ────────────────────────────────────────────
-const callSpeechTimes = {}; // callControlId -> { Rep: ms, Prospect: ms }
-const audioBuffers    = {}; // callControlId -> { Rep: [{ts,audio}], Prospect: [{ts,audio}], stopped: 0 }
+const callSpeechTimes = {};
+const audioBuffers    = {};
 
-// ── A-law decode table ───────────────────────────────────────────
 const ALAW_DECODE = (() => {
 	const t = new Int16Array(256);
 	for (let i = 0; i < 256; i++) {
 		let val = i ^ 0x55;
 		let seg = (val & 0x70) >> 4;
-		let s = (val & 0x0F) << 1 | 1;
+		let s   = (val & 0x0F) << 1 | 1;
 		if (seg) s = (s + 32) << (seg - 1);
 		t[i] = (val & 0x80) ? s : -s;
 	}
 	return t;
 })();
 
-// ── Build stereo WAV using Telnyx timestamps (no guessing) ───────
-// Left channel = Rep, Right channel = Prospect
-// Each frame placed at its exact timestamp from Telnyx
 function buildStereoWav(repFrames, prospectFrames) {
 	const SAMPLE_RATE      = 8000;
 	const CHANNELS         = 2;
-	const BYTES_PER_SAMPLE = 2; // 16-bit PCM
-
-	// Find total duration
+	const BYTES_PER_SAMPLE = 2;
+	const GAIN             = 6.0;
 	let maxTs = 0;
 	for (const f of repFrames)      if (f.ts > maxTs) maxTs = f.ts;
 	for (const f of prospectFrames) if (f.ts > maxTs) maxTs = f.ts;
-	const totalMs      = maxTs + 20; // +20ms for last frame
-	const totalSamples = Math.ceil(totalMs * SAMPLE_RATE / 1000);
-
-	// Stereo interleaved PCM buffer (L=Rep, R=Prospect)
-	const pcm = Buffer.alloc(totalSamples * CHANNELS * BYTES_PER_SAMPLE, 0);
-
-	// Apply gain to boost volume (A-law decoded PCM is often too quiet)
-	const GAIN = 6.0; // 6x amplification - adjust if too loud/quiet
-
+	const totalSamples = Math.ceil((maxTs + 20) * SAMPLE_RATE / 1000);
+	const pcm          = Buffer.alloc(totalSamples * CHANNELS * BYTES_PER_SAMPLE, 0);
 	function writeFrames(frames, channel) {
 		for (const { ts, audio } of frames) {
 			const startSample = Math.floor(ts * SAMPLE_RATE / 1000);
 			for (let i = 0; i < audio.length; i++) {
-				const raw        = ALAW_DECODE[audio[i]];
-				// Apply gain and clamp to 16-bit range
-				const amplified  = Math.max(-32768, Math.min(32767, Math.round(raw * GAIN)));
+				const amp        = Math.max(-32768, Math.min(32767, Math.round(ALAW_DECODE[audio[i]] * GAIN)));
 				const byteOffset = ((startSample + i) * CHANNELS + channel) * BYTES_PER_SAMPLE;
-				if (byteOffset + 1 < pcm.length) pcm.writeInt16LE(amplified, byteOffset);
+				if (byteOffset + 1 < pcm.length) pcm.writeInt16LE(amp, byteOffset);
 			}
 		}
 	}
-
-	writeFrames(repFrames,      0); // Left  = Rep
-	writeFrames(prospectFrames, 1); // Right = Prospect
-
-	// WAV header - stereo 16-bit PCM
+	writeFrames(repFrames, 0);
+	writeFrames(prospectFrames, 1);
 	const header = Buffer.alloc(44);
 	header.write("RIFF", 0);
 	header.writeUInt32LE(pcm.length + 36, 4);
 	header.write("WAVE", 8);
 	header.write("fmt ", 12);
 	header.writeUInt32LE(16, 16);
-	header.writeUInt16LE(1, 20);   // PCM
+	header.writeUInt16LE(1, 20);
 	header.writeUInt16LE(CHANNELS, 22);
 	header.writeUInt32LE(SAMPLE_RATE, 24);
 	header.writeUInt32LE(SAMPLE_RATE * CHANNELS * BYTES_PER_SAMPLE, 28);
@@ -81,22 +64,13 @@ function buildStereoWav(repFrames, prospectFrames) {
 	header.writeUInt16LE(16, 34);
 	header.write("data", 36);
 	header.writeUInt32LE(pcm.length, 40);
-
 	return Buffer.concat([header, pcm]);
 }
 
 async function uploadAudio(callControlId, repFrames, prospectFrames) {
 	try {
 		if (!repFrames.length && !prospectFrames.length) return;
-
-		const wavFile = buildStereoWav(repFrames, prospectFrames);
-		console.log(ts(), "AUDIO BUILD", {
-			callControlId,
-			repFrames: repFrames.length,
-			prospectFrames: prospectFrames.length,
-			wavBytes: wavFile.length
-		});
-
+		const wavFile  = buildStereoWav(repFrames, prospectFrames);
 		const boundary = "----Boundary" + Date.now();
 		const CRLF     = "\r\n";
 		const meta     =
@@ -106,24 +80,44 @@ async function uploadAudio(callControlId, repFrames, prospectFrames) {
 			"--" + boundary + CRLF +
 			'Content-Disposition: form-data; name="audio"; filename="audio.wav"' + CRLF +
 			"Content-Type: audio/wav" + CRLF + CRLF;
-		const end  = CRLF + "--" + boundary + "--" + CRLF;
-		const body = Buffer.concat([Buffer.from(meta), wavFile, Buffer.from(end)]);
-
-		const r = await fetch("https://lumafront.com/database/AI/sale_assistant/webhooks/save_audio.php", {
+		const body = Buffer.concat([Buffer.from(meta), wavFile, Buffer.from(CRLF + "--" + boundary + "--" + CRLF)]);
+		const r    = await fetch(PHP_BASE + "/save_audio.php", {
 			method: "POST",
-			headers: {
-				"Content-Type":   "multipart/form-data; boundary=" + boundary,
-				"Content-Length": body.length
-			},
+			headers: { "Content-Type": "multipart/form-data; boundary=" + boundary, "Content-Length": body.length },
 			body
 		});
-		console.log(ts(), "AUDIO UPLOAD", r.status, { bytes: wavFile.length });
+		console.log(ts(), "AUDIO UPLOAD", r.status, { wavBytes: wavFile.length });
 	} catch (e) {
 		console.log(ts(), "AUDIO UPLOAD ERROR", e && e.message ? e.message : e);
 	}
 }
 
-// ── Deepgram connection factory ──────────────────────────────────
+async function saveCost(callControlId, repFrameCount, prospectFrameCount) {
+	try {
+		const DG_COST_PER_MIN = 0.0043;
+		const repMs           = repFrameCount * 20;
+		const prospectMs      = prospectFrameCount * 20;
+		const repMin          = Math.ceil(repMs      / 1000) / 60;
+		const prospectMin     = Math.ceil(prospectMs / 1000) / 60;
+		const cost_usd        = parseFloat(((repMin + prospectMin) * DG_COST_PER_MIN).toFixed(6));
+		const payload         = {
+			call_control_id: callControlId,
+			rep_seconds:      Math.round(repMs / 1000),
+			prospect_seconds: Math.round(prospectMs / 1000),
+			total_seconds:    Math.round((repMs + prospectMs) / 1000),
+			cost_usd
+		};
+		console.log(ts(), "DEEPGRAM COST", payload);
+		await fetch(PHP_BASE + "/save_cost.php", {
+			method:  "POST",
+			headers: { "Content-Type": "application/json" },
+			body:    JSON.stringify(payload)
+		});
+	} catch (e) {
+		console.log(ts(), "SAVE COST ERROR", e && e.message ? e.message : e);
+	}
+}
+
 function makeDgWs(role, getCC, getCSW) {
 	const dgUrl =
 		"wss://api.deepgram.com/v1/listen" +
@@ -135,14 +129,13 @@ function makeDgWs(role, getCC, getCSW) {
 		"&endpointing=150";
 
 	const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
-	dg.on("open",  ()    => console.log(ts(), "DEEPGRAM OPEN",  { role }));
-	dg.on("error", (e)   => console.log(ts(), "DEEPGRAM ERROR", { role, err: e && e.message ? e.message : e }));
-	dg.on("close", (c,r) => console.log(ts(), "DEEPGRAM CLOSE", { role, code: c }));
+	dg.on("open",  ()  => console.log(ts(), "DEEPGRAM OPEN",  { role }));
+	dg.on("error", (e) => console.log(ts(), "DEEPGRAM ERROR", { role, err: e && e.message ? e.message : e }));
+	dg.on("close", (c) => console.log(ts(), "DEEPGRAM CLOSE", { role, code: c }));
 
 	dg.on("message", async (raw) => {
 		let j; try { j = JSON.parse(raw); } catch { return; }
 		if (!j.is_final) return;
-
 		const alt  = j?.channel?.alternatives?.[0];
 		const text = alt?.transcript;
 		if (!text || !text.trim()) return;
@@ -150,7 +143,6 @@ function makeDgWs(role, getCC, getCSW) {
 		const callControlId   = getCC();
 		const callStartWallMs = getCSW();
 		const nowMs           = Date.now();
-
 		let durMs = 0;
 		if (alt.words && alt.words.length > 0) {
 			durMs = Math.round(((alt.words[alt.words.length-1].end||0) - (alt.words[0].start||0)) * 1000);
@@ -158,17 +150,16 @@ function makeDgWs(role, getCC, getCSW) {
 		const startMs   = nowMs - durMs;
 		const otherRole = role === "Rep" ? "Prospect" : "Rep";
 		if (!callSpeechTimes[callControlId]) callSpeechTimes[callControlId] = {};
-		const otherEnd = callSpeechTimes[callControlId][otherRole] || 0;
-		const overlap  = startMs < (otherEnd - 800);
+		const overlap = startMs < ((callSpeechTimes[callControlId][otherRole] || 0) - 800);
 		callSpeechTimes[callControlId][role] = nowMs;
 
 		console.log(ts(), "TRANSCRIPT", { role, text, overlap });
 
 		try {
-			await fetch("https://lumafront.com/database/AI/sale_assistant/webhooks/transcript.php", {
-				method: "POST",
+			await fetch(PHP_BASE + "/transcript.php", {
+				method:  "POST",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify({
+				body:    JSON.stringify({
 					call_control_id: callControlId, role, text, overlap,
 					start: (startMs - callStartWallMs) / 1000,
 					end:   (nowMs   - callStartWallMs) / 1000,
@@ -178,48 +169,20 @@ function makeDgWs(role, getCC, getCSW) {
 		} catch (e) {
 			console.log(ts(), "TRANSCRIPT POST ERROR", e && e.message ? e.message : e);
 		}
+
+		// Trigger AI suggestion instantly after every Prospect utterance
+		if (role === "Prospect") {
+			fetch(PHP_BASE + "/suggest.php", {
+				method:  "POST",
+				headers: { "Content-Type": "application/json" },
+				body:    JSON.stringify({ call_control_id: callControlId })
+			}).catch(e => console.log(ts(), "SUGGEST TRIGGER ERROR", e && e.message ? e.message : e));
+		}
 	});
 
 	return dg;
 }
 
-// ── Deepgram cost calculation ────────────────────────────────────
-// nova-2-phonecall: $0.0043 per minute (as of 2024)
-const DG_COST_PER_MIN = 0.0043;
-
-async function saveCost(callControlId, repFrameCount, prospectFrameCount) {
-	try {
-		// Each frame = 20ms of audio. Two separate DG connections (Rep + Prospect)
-		const repMs       = repFrameCount      * 20;
-		const prospectMs  = prospectFrameCount * 20;
-		const totalMs     = repMs + prospectMs;
-		const totalMin    = totalMs / 1000 / 60;
-		// Deepgram bills each stream separately, rounded up to nearest second
-		const repMin      = Math.ceil(repMs      / 1000) / 60;
-		const prospectMin = Math.ceil(prospectMs / 1000) / 60;
-		const cost        = ((repMin + prospectMin) * DG_COST_PER_MIN);
-
-		const payload = {
-			call_control_id: callControlId,
-			rep_seconds:      Math.round(repMs      / 1000),
-			prospect_seconds: Math.round(prospectMs / 1000),
-			total_seconds:    Math.round(totalMs    / 1000),
-			cost_usd:         parseFloat(cost.toFixed(6))
-		};
-
-		console.log(ts(), "DEEPGRAM COST", payload);
-
-		await fetch("https://lumafront.com/database/AI/sale_assistant/webhooks/save_cost.php", {
-			method:  "POST",
-			headers: { "Content-Type": "application/json" },
-			body:    JSON.stringify(payload)
-		});
-	} catch (e) {
-		console.log(ts(), "SAVE COST ERROR", e && e.message ? e.message : e);
-	}
-}
-
-// ── HTTP ─────────────────────────────────────────────────────────
 const server = http.createServer((req, res) => {
 	if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
 		res.writeHead(200); res.end("ok"); return;
@@ -227,7 +190,6 @@ const server = http.createServer((req, res) => {
 	res.writeHead(404); res.end("not found");
 });
 
-// ── WebSocket ─────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ noServer: true });
 
 wss.on("connection", (telnyxWs, req) => {
@@ -237,22 +199,16 @@ wss.on("connection", (telnyxWs, req) => {
 	let callControlId   = "";
 	let callStartWallMs = Date.now();
 	let mediaFrames     = 0;
-	let firstRtpTs      = null; // first RTP timestamp seen on this connection
+	let firstRtpTs      = null;
 
-	const getCC  = () => callControlId;
-	const getCSW = () => callStartWallMs;
-
-	// One Deepgram connection per WebSocket (one per track)
-	const dg = makeDgWs(role, getCC, getCSW);
+	const dg = makeDgWs(role, () => callControlId, () => callStartWallMs);
 
 	console.log(ts(), "TELNYX CONNECT", { path, role });
-
-	telnyxWs.on("error", (e)   => console.log(ts(), "TELNYX ERROR", e && e.message ? e.message : e));
-	telnyxWs.on("close", (c)   => console.log(ts(), "TELNYX CLOSE", { code: c, role }));
+	telnyxWs.on("error", (e) => console.log(ts(), "TELNYX ERROR", e && e.message ? e.message : e));
+	telnyxWs.on("close", (c) => console.log(ts(), "TELNYX CLOSE", { code: c, role }));
 
 	telnyxWs.on("message", (msg) => {
 		let data; try { data = JSON.parse(msg); } catch { return; }
-
 		if (data.event === "connected") return;
 
 		if (data.event === "start") {
@@ -261,14 +217,11 @@ wss.on("connection", (telnyxWs, req) => {
 				callControlId   = cc;
 				callStartWallMs = Date.now();
 				console.log(ts(), "CALL CONTROL ID SET", { callControlId, role });
-
-				// Merge any pre-buffered audio frames
 				const pk = "pending_" + path;
 				if (audioBuffers[pk]) {
 					if (!audioBuffers[callControlId]) audioBuffers[callControlId] = { Rep: [], Prospect: [], stopped: 0 };
 					audioBuffers[callControlId][role].push(...audioBuffers[pk][role]);
 					delete audioBuffers[pk];
-					console.log(ts(), "MERGED PENDING AUDIO", { role, frames: audioBuffers[callControlId][role].length });
 				}
 			}
 			console.log(ts(), "STREAM START", { role, encoding: data?.start?.media_format?.encoding });
@@ -278,17 +231,11 @@ wss.on("connection", (telnyxWs, req) => {
 		if (data.event === "media" && data.media && data.media.payload) {
 			mediaFrames++;
 			if (mediaFrames === 1) console.log(ts(), "FIRST MEDIA FRAME", { role, path });
-
-			const audio      = Buffer.from(data.media.payload, "base64");
-			const rawRtpTs   = parseInt(data.media.timestamp || "0", 10);
-			// RTP timestamp counts at 8000Hz - convert to milliseconds from call start
+			const audio    = Buffer.from(data.media.payload, "base64");
+			const rawRtpTs = parseInt(data.media.timestamp || "0", 10);
 			if (firstRtpTs === null) firstRtpTs = rawRtpTs;
-			const frameTs = Math.round((rawRtpTs - firstRtpTs) / 8);
-
-			// Send to Deepgram for transcription
+			const frameTs  = Math.round((rawRtpTs - firstRtpTs) / 8);
 			if (dg.readyState === WebSocket.OPEN) dg.send(audio);
-
-			// Buffer with exact Telnyx timestamp for audio recording
 			const bufKey = callControlId || ("pending_" + path);
 			if (!audioBuffers[bufKey]) audioBuffers[bufKey] = { Rep: [], Prospect: [], stopped: 0 };
 			audioBuffers[bufKey][role].push({ ts: frameTs, audio });
@@ -297,16 +244,11 @@ wss.on("connection", (telnyxWs, req) => {
 
 		if (data.event === "stop") {
 			console.log(ts(), "TELNYX STOP", { role, mediaFrames, callControlId });
-
-			// Finalize Deepgram - wait 4s for last transcript then upload audio
 			try { if (dg.readyState === WebSocket.OPEN) dg.send(JSON.stringify({ type: "Finalize" })); } catch {}
-
 			setTimeout(() => {
 				try { dg.close(); } catch {}
-
 				if (!audioBuffers[callControlId]) return;
 				audioBuffers[callControlId].stopped += 1;
-
 				const doUpload = () => {
 					const buf = audioBuffers[callControlId];
 					if (!buf) return;
@@ -315,12 +257,9 @@ wss.on("connection", (telnyxWs, req) => {
 					saveCost(callControlId, buf.Rep.length, buf.Prospect.length);
 					setTimeout(() => { delete callSpeechTimes[callControlId]; }, 5000);
 				};
-
-				// Two WS connections (/in and /out) so wait for stopped===2
 				if (audioBuffers[callControlId].stopped >= 2) {
 					doUpload();
 				} else {
-					// Safety: if other track doesn't stop within 5s, upload anyway
 					setTimeout(() => { if (audioBuffers[callControlId]) doUpload(); }, 5000);
 				}
 			}, 4000);
