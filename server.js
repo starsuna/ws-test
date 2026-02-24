@@ -170,8 +170,9 @@ function makeDgWs(role, getCC, getCSW) {
 			console.log(ts(), "TRANSCRIPT POST ERROR", e && e.message ? e.message : e);
 		}
 
-		// Trigger AI suggestion instantly after every Prospect utterance
-		if (role === "Prospect") {
+		// Trigger AI suggestion only after genuine Prospect utterances
+		// Skip if overlap (audio bleed from rep) or text too short to be meaningful
+		if (role === "Prospect" && !overlap && text.split(' ').length >= 2) {
 			fetch(PHP_BASE + "/suggest.php", {
 				method:  "POST",
 				headers: { "Content-Type": "application/json" },
