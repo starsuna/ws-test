@@ -182,7 +182,7 @@ function makeDgWs(role, getCC, getCSW) {
 					headers: { "Content-Type": "application/json" },
 					body:    JSON.stringify({ call_control_id: callControlId })
 				}).catch(e => console.log(ts(), "SUGGEST TRIGGER ERROR", e && e.message ? e.message : e));
-			}, 1500);
+			}, 300);
 		}
 	});
 
