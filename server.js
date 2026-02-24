@@ -132,7 +132,12 @@ function makeDgWs(role, getCC, getCSW) {
 	const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
 	dg.on("open",  ()  => console.log(ts(), "DEEPGRAM OPEN",  { role }));
 	dg.on("error", (e) => console.log(ts(), "DEEPGRAM ERROR", { role, err: e && e.message ? e.message : e }));
-	dg.on("close", (c) => console.log(ts(), "DEEPGRAM CLOSE", { role, code: c }));
+	dg.on("close", (c) => {
+		console.log(ts(), "DEEPGRAM CLOSE", { role, code: c });
+		// code 1011 = Deepgram server error, reconnect automatically
+		// We use the reconnectFn callback passed in from the connection handler
+		if (c === 1011 && reconnectFn) setTimeout(reconnectFn, 500);
+	});
 
 	dg.on("message", async (raw) => {
 		let j; try { j = JSON.parse(raw); } catch { return; }
@@ -207,7 +212,15 @@ wss.on("connection", (telnyxWs, req) => {
 	let mediaFrames     = 0;
 	let firstRtpTs      = null;
 
-	const dg = makeDgWs(role, () => callControlId, () => callStartWallMs);
+	let dg = makeDgWs(role, () => callControlId, () => callStartWallMs, reconnectDg);
+	let dgClosed = false;
+
+	// Auto-reconnect Deepgram if it drops mid-call (e.g. code 1011)
+	function reconnectDg() {
+		if (dgClosed) return; // call already ended, don't reconnect
+		console.log(ts(), "DEEPGRAM RECONNECTING", { role });
+		dg = makeDgWs(role, () => callControlId, () => callStartWallMs, reconnectDg);
+	}
 
 	console.log(ts(), "TELNYX CONNECT", { path, role });
 	telnyxWs.on("error", (e) => console.log(ts(), "TELNYX ERROR", e && e.message ? e.message : e));
@@ -249,6 +262,7 @@ wss.on("connection", (telnyxWs, req) => {
 		}
 
 		if (data.event === "stop") {
+			dgClosed = true;
 			console.log(ts(), "TELNYX STOP", { role, mediaFrames, callControlId });
 			try { if (dg.readyState === WebSocket.OPEN) dg.send(JSON.stringify({ type: "Finalize" })); } catch {}
 			setTimeout(() => {
