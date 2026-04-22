@@ -82,7 +82,7 @@ async function uploadAudio(callControlId, repFrames, prospectFrames) {
 			'Content-Disposition: form-data; name="audio"; filename="audio.wav"' + CRLF +
 			"Content-Type: audio/wav" + CRLF + CRLF;
 		const body = Buffer.concat([Buffer.from(meta), wavFile, Buffer.from(CRLF + "--" + boundary + "--" + CRLF)]);
-		const r    = await fetch(PHP_BASE + "/save_audio.php", {
+		const r    = await fetch(PHP_BASE + "/save_audio", {
 			method: "POST",
 			headers: { "Content-Type": "multipart/form-data; boundary=" + boundary, "Content-Length": body.length },
 			body
@@ -109,7 +109,7 @@ async function saveCost(callControlId, repFrameCount, prospectFrameCount) {
 			cost_usd
 		};
 		console.log(ts(), "DEEPGRAM COST", payload);
-		await fetch(PHP_BASE + "/save_cost.php", {
+		await fetch(PHP_BASE + "/save_cost", {
 			method:  "POST",
 			headers: { "Content-Type": "application/json" },
 			body:    JSON.stringify(payload)
@@ -162,7 +162,7 @@ function makeDgWs(role, getCC, getCSW) {
 		console.log(ts(), "TRANSCRIPT", { role, text, overlap });
 
 		try {
-			await fetch(PHP_BASE + "/transcript.php", {
+			await fetch(PHP_BASE + "/transcript", {
 				method:  "POST",
 				headers: { "Content-Type": "application/json" },
 				body:    JSON.stringify({
@@ -182,7 +182,7 @@ function makeDgWs(role, getCC, getCSW) {
 		if (role === "Prospect" && !overlap && text.split(' ').length >= 2) {
 			clearTimeout(suggestTimers[callControlId]);
 			suggestTimers[callControlId] = setTimeout(() => {
-				fetch(PHP_BASE + "/suggest.php", {
+				fetch(PHP_BASE + "/suggest", {
 					method:  "POST",
 					headers: { "Content-Type": "application/json" },
 					body:    JSON.stringify({ call_control_id: callControlId })
