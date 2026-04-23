@@ -175,20 +175,6 @@ function makeDgWs(role, getCC, getCSW) {
 		} catch (e) {
 			console.log(ts(), "TRANSCRIPT POST ERROR", e && e.message ? e.message : e);
 		}
-
-		// Trigger AI suggestion only after genuine Prospect utterances
-		// Debounce: wait 1500ms after last prospect chunk before firing suggest
-		// This prevents mid-sentence triggers when endpointing splits speech into chunks
-		if (role === "Prospect" && !overlap && text.split(' ').length >= 1) {
-			clearTimeout(suggestTimers[callControlId]);
-			suggestTimers[callControlId] = setTimeout(() => {
-				fetch(PHP_BASE + "/suggest", {
-					method:  "POST",
-					headers: { "Content-Type": "application/json" },
-					body:    JSON.stringify({ call_control_id: callControlId })
-				}).catch(e => console.log(ts(), "SUGGEST TRIGGER ERROR", e && e.message ? e.message : e));
-			}, 300);
-		}
 	});
 
 	return dg;
