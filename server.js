@@ -179,7 +179,7 @@ function makeDgWs(role, getCC, getCSW) {
 		// Trigger AI suggestion only after genuine Prospect utterances
 		// Debounce: wait 1500ms after last prospect chunk before firing suggest
 		// This prevents mid-sentence triggers when endpointing splits speech into chunks
-		if (role === "Prospect" && !overlap && text.split(' ').length >= 2) {
+		if (role === "Prospect" && !overlap && text.split(' ').length >= 1) {
 			clearTimeout(suggestTimers[callControlId]);
 			suggestTimers[callControlId] = setTimeout(() => {
 				fetch(PHP_BASE + "/suggest", {
