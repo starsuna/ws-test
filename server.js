@@ -121,13 +121,11 @@ async function saveCost(callControlId, repFrameCount, prospectFrameCount) {
 
 function makeDgWs(role, getCC, getCSW) {
 	const dgUrl =
-		"wss://api.deepgram.com/v1/listen" +
-		"?model=nova-3" +
-		"&encoding=alaw" +
-		"&sample_rate=8000" +
-		"&smart_format=true" +
-		"&interim_results=true" +
-		"&endpointing=300&utterance_end_ms=1000&vad_events=true";
+	    "wss://api.deepgram.com/v2/listen" +
+	    "?model=flux-general-en" +
+	    "&encoding=alaw" +
+	    "&sample_rate=8000" +
+	    "&eot_threshold=0.7";
 
 	const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
 	dg.on("open",  ()  => console.log(ts(), "DEEPGRAM OPEN",  { role }));
@@ -140,10 +138,10 @@ function makeDgWs(role, getCC, getCSW) {
 	});
 
 	dg.on("message", async (raw) => {
-		let j; try { j = JSON.parse(raw); } catch { return; }
-		if (!j.is_final) return;
-		const alt  = j?.channel?.alternatives?.[0];
-		const text = alt?.transcript;
+	    let j; try { j = JSON.parse(raw); } catch { return; }
+	    if (j.type !== "TurnInfo" || j.event !== "EndOfTurn") return;
+	    const alt  = { transcript: j.transcript, words: j.words };
+	    const text = alt.transcript;
 		if (!text || !text.trim()) return;
 
 		const callControlId   = getCC();
