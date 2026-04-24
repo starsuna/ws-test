@@ -122,12 +122,12 @@ async function saveCost(callControlId, repFrameCount, prospectFrameCount) {
 function makeDgWs(role, getCC, getCSW) {
 	const dgUrl =
 		"wss://api.deepgram.com/v1/listen" +
-		"?model=nova-2-phonecall" +
+		"?model=nova-3" +
 		"&encoding=alaw" +
 		"&sample_rate=8000" +
 		"&smart_format=true" +
 		"&interim_results=true" +
-		"&endpointing=10";
+		"&endpointing=300&utterance_end_ms=1000&vad_events=true";
 
 	const dg = new WebSocket(dgUrl, { headers: { Authorization: `Token ${DEEPGRAM_API_KEY}` } });
 	dg.on("open",  ()  => console.log(ts(), "DEEPGRAM OPEN",  { role }));
@@ -160,6 +160,7 @@ function makeDgWs(role, getCC, getCSW) {
 		callSpeechTimes[callControlId][role] = nowMs;
 
 		console.log(ts(), "TRANSCRIPT", { role, text, overlap });
+		console.log(ts(), "TRANSCRIPT_TIMING", { role, text, words_end_sec: alt.words ? alt.words[alt.words.length-1].end : null });
 
 		try {
 			await fetch(PHP_BASE + "/transcript", {
